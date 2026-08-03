@@ -570,6 +570,12 @@ createApp({
       if (_blockIfPrinting()) return;
       run("ACE_UNLOAD_ALL_HEADS");
     }
+    function cancelUnloadAll() {
+      run("ACE_UNLOAD_ALL_CANCEL");
+    }
+    const anyUnloading = computed(() =>
+      Object.values(toolheadOps.value).some(op => op === 'unloading')
+    );
     async function setHeadManual(idx, enable) {
       try {
         await fetch(`${API}/head-manual`, {
@@ -1195,6 +1201,151 @@ createApp({
       enqueue("MULTIACE_REFRESH_OVERRIDES", {}, {silent: true});
       reloadState();
     }
+    // ---- Spoolman spool picker -------------------------------------------
+    // Loads spools from Moonraker's Spoolman proxy (/api/spoolman).
+    // Opens a searchable modal per slot; selecting a spool posts a slot
+    // override with the spool's material/brand/color + stores spool_id.
+    const spoolman = reactive({ active: false, spools: [], loading: false, url: null, checked: false });
+    const spoolPicker = reactive({ show: false, ace: null, slot: null, filter: "" });
+
+    async function loadSpoolman() {
+      if (spoolman.loading) return;
+      spoolman.loading = true;
+      try {
+        const r = await fetch(`${API}/spoolman`);
+        if (!r.ok) return; // server error — keep last known state
+        const j = await r.json();
+        spoolman.url = j.url || null;
+        if (j.url === null || j.url === undefined) {
+          // Spoolman not configured in extended2.cfg → hide buttons
+          spoolman.active = false;
+          spoolman.spools = [];
+        } else if (j.active) {
+          // Configured and reachable → update list
+          spoolman.active = true;
+          spoolman.spools = Array.isArray(j.spools) ? j.spools : [];
+        }
+        // url set but active=false: configured but temporarily unreachable.
+        // Keep spoolman.active as-is so buttons don't disappear on a blip.
+      } catch (_) {
+        // Network error — keep last known state, do NOT set active=false
+      } finally {
+        spoolman.loading = false;
+        spoolman.checked = true;
+      }
+    }
+
+    const spoolPickerFiltered = computed(() => {
+      const f = (spoolPicker.filter || "").trim().toLowerCase();
+      const list = spoolman.spools.filter(sp => !(sp.archived));
+      if (!f) return list;
+      return list.filter(sp => {
+        const fil = sp.filament || {};
+        const vendor = ((fil.vendor && fil.vendor.name) || fil.vendor || "").toLowerCase();
+        const mat = (fil.material || "").toLowerCase();
+        const name = (fil.name || "").toLowerCase();
+        return mat.includes(f) || vendor.includes(f) || name.includes(f);
+      });
+    });
+
+    const spoolPickerSlotHasOverride = computed(() => {
+      if (!spoolPicker.show || spoolPicker.ace === null) return false;
+      const a = state.aces.find(x => x.idx === spoolPicker.ace);
+      const s = a && (a.slots || []).find(sl => sl.idx === spoolPicker.slot);
+      return !!(s && s.source === "override");
+    });
+
+    function openSpoolPicker(ace, slot) {
+      spoolPicker.show = true;
+      spoolPicker.ace = ace.idx;
+      spoolPicker.slot = slot.idx;
+      spoolPicker.filter = "";
+      // Refresh list on every open; improved error handling means a blip
+      // won't hide the button (spoolman.active only clears on 'not configured').
+      loadSpoolman();
+    }
+    function closeSpoolPicker() { spoolPicker.show = false; }
+
+    function openSpoolPickerFromPicker() {
+      // Called from inside the slot picker dialog — bridge to spool picker
+      // using the ace/slot already set on the picker state.
+      const aceIdx = picker.ace;
+      const slotIdx = picker.slot;
+      closePicker();
+      spoolPicker.show = true;
+      spoolPicker.ace = aceIdx;
+      spoolPicker.slot = slotIdx;
+      spoolPicker.filter = "";
+      loadSpoolman();
+    }
+
+    async function clearSpoolPickerOverride() {
+      const aceIdx = spoolPicker.ace;
+      const slotIdx = spoolPicker.slot;
+      try {
+        await fetch(`${API}/slot-override/${aceIdx}/${slotIdx}`, { method: "DELETE" });
+      } catch (e) {
+        setMacroLog(`${t("ui.common.error")}: ${e}`);
+      }
+      closeSpoolPicker();
+      enqueue("MULTIACE_REFRESH_OVERRIDES", {}, { silent: true });
+      reloadState();
+    }
+
+    async function pickSpool(spool) {
+      const aceIdx = spoolPicker.ace;
+      const slotIdx = spoolPicker.slot;
+      const fil = spool.filament || {};
+      const colorRaw = (fil.color_hex || "ffffff").replace(/^#/, "");
+      const color = "#" + colorRaw.toLowerCase().padEnd(6, "0").slice(0, 6);
+      const brand = ((fil.vendor && fil.vendor.name) || (typeof fil.vendor === "string" ? fil.vendor : "") || "").trim();
+      const material = (fil.material || "PLA").trim();
+      // Use filament name as subtype when set; it carries "Matte", "Silk", etc.
+      const subtype = (fil.name || "").trim();
+      try {
+        await fetch(`${API}/slot-override`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ace: aceIdx, slot: slotIdx,
+            material, brand, subtype, color,
+            spool_id: spool.id ?? null,
+          }),
+        });
+      } catch (e) {
+        setMacroLog(`${t("ui.common.error")}: ${e}`);
+      }
+      closeSpoolPicker();
+      enqueue("MULTIACE_REFRESH_OVERRIDES", {}, { silent: true });
+      reloadState();
+    }
+
+    function _spoolColorHex(spool) {
+      const h = ((spool.filament || {}).color_hex || "").replace(/^#/, "");
+      return h.length >= 6 ? "#" + h.slice(0, 6) : "#888888";
+    }
+    function _spoolColorLum(hex) {
+      const r = parseInt(hex.slice(1, 3), 16);
+      const g = parseInt(hex.slice(3, 5), 16);
+      const b = parseInt(hex.slice(5, 7), 16);
+      return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    }
+    function spoolCardStyle(spool) {
+      const hex = _spoolColorHex(spool);
+      return { "--spool-color": hex, "--spool-fg": _spoolColorLum(hex) > 0.55 ? "#001619" : "#fff" };
+    }
+    function spoolLabel(spool) {
+      const fil = spool.filament || {};
+      const parts = [];
+      const vendor = ((fil.vendor && fil.vendor.name) || (typeof fil.vendor === "string" ? fil.vendor : "") || "").trim();
+      if (vendor) parts.push(vendor);
+      if (fil.material) parts.push(fil.material);
+      if (fil.name) parts.push(fil.name);
+      if (spool.remaining_weight != null) parts.push(Math.round(spool.remaining_weight) + "g");
+      else if (spool.weight != null) parts.push(Math.round(spool.weight) + "g");
+      return parts.join(" · ");
+    }
+
     let _lastActive = null;
     watch(() => state.active_device, (newAce) => {
       _lastActive = newAce;
@@ -2870,6 +3021,7 @@ createApp({
       await loadNotifications();
       await refreshDebugState();
       await refreshPlugins();
+      loadSpoolman();  // non-blocking: sets spoolman.active so the 🎣 button appears
       if (state.mode === "normal" && tab.value === "dashboard") tab.value = "config";
       wsConnect();
       if (window.ResizeObserver && wiringContainerEl.value) {
@@ -2902,7 +3054,7 @@ createApp({
       sourceLabel,
       tab, version, printerName, printerFw, connClass, connText, screenAvailable,
       state, loadError, run, macroLog,
-      slotTitle, switchAce, loadSlot, loadFeederHead, slotLoadedInHead, loadAll, unloadHead, unloadAll, setHeadManual, setHeadFeeder, setHeadAce, aceOptionsForHead, headAceOf, visibleAces, openHeadPicker, isToolheadOccupied, needsReload, toolheadOps, bgEnabledFor, setBgHead, setPickupCleaning,
+      slotTitle, switchAce, loadSlot, loadFeederHead, slotLoadedInHead, loadAll, unloadHead, unloadAll, cancelUnloadAll, anyUnloading, setHeadManual, setHeadFeeder, setHeadAce, aceOptionsForHead, headAceOf, visibleAces, openHeadPicker, isToolheadOccupied, needsReload, toolheadOps, bgEnabledFor, setBgHead, setPickupCleaning,
       isPrinting,
       dryerCfg, dryStart, dryStop, dryOpenAce, toggleDryPanel, aceDrying,
       snapshots, selectedSnapshot, snapshotPreview, saveSnapshot, loadSnapshot, deleteSnapshot,
@@ -2934,6 +3086,8 @@ createApp({
       picker, openPicker, closePicker, savePicker, clearPickerOverride, pickerMaterials,
       pickerDb, pickerVendors, currentSubtypes,
       pickerHasRfid, pickerHasOverride, pickerRfidStyle, readPickerRfid,
+      spoolman, spoolPicker, spoolPickerFiltered, spoolPickerSlotHasOverride,
+      openSpoolPicker, openSpoolPickerFromPicker, closeSpoolPicker, pickSpool, clearSpoolPickerOverride, spoolCardStyle, spoolLabel,
       cmdQueue, visibleQueue, cmdPaused, removeFromQueue, pauseQueue, resumeQueue, clearAllErrors,
       sendingAll, sendAllToPrinter,
       fmtArgs, cmdLabel,

@@ -222,6 +222,12 @@ header h1 .hl { color: var(--accent); }
   text-transform: none; letter-spacing: 0; font-weight: 500;
 }
 .th-section-head .unload-all-btn:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
+.th-section-head .cancel-unload-btn {
+  background: var(--danger); color: #fff; border: 1px solid var(--danger);
+  padding: .35rem .7rem; border-radius: 4px; cursor: pointer; font-size: .85rem;
+  font-weight: 700; margin-left: .3rem;
+}
+.th-section-head .cancel-unload-btn:hover { opacity: .8; }
 .slot-row { display: flex; gap: .3rem; margin: .5rem 0; }
 .slot-cell { flex: 1; display: flex; flex-direction: column; gap: .25rem; }
 .slot-cell .slot { width: 100%; }
@@ -233,6 +239,22 @@ header h1 .hl { color: var(--accent); }
 }
 .slot-load-btn:hover:not(:disabled) { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .slot-load-btn:disabled { opacity: .35; cursor: not-allowed; }
+/* Spoolman modal */
+.spoolman-dialog { min-width: min(28rem, 95vw); max-height: 80vh; display: flex; flex-direction: column; }
+.spoolman-dialog h3 { margin: 0 0 .6rem; }
+.spool-list { overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: .3rem; max-height: 55vh; }
+.spool-item {
+  display: flex; align-items: center; gap: .6rem;
+  background: var(--card); border: 1px solid var(--border); border-radius: 4px;
+  padding: .35rem .6rem; cursor: pointer; text-align: left; font-family: inherit; font-size: .9rem;
+  color: var(--fg); width: 100%;
+}
+.spool-item:hover { border-color: var(--accent); background: var(--hover-bg, #1e2a2a); }
+.spool-swatch {
+  width: 1.1rem; height: 1.1rem; border-radius: 3px; flex-shrink: 0;
+  background: var(--spool-color, #888); border: 1px solid rgba(255,255,255,.15);
+}
+.spool-desc { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .slot-load-btn.reload {
   background: #b9770e; color: #fff; border-color: #b9770e; font-weight: 600;
   animation: reload-pulse 1.4s ease-in-out infinite;

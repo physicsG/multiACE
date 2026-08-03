@@ -37,6 +37,11 @@
       <option v-for="l in languages" :key="l.code" :value="l.code">{{ l.name }}</option>
     </select>
     <span class="conn" :class="connClass">{{ connText }}</span>
+    <span class="conn spoolman-chip"
+          :class="!spoolman.checked ? '' : spoolman.active ? 'ok' : spoolman.url ? 'warn' : ''"
+          :title="spoolman.active ? 'Spoolman connected: ' + spoolman.url
+                  : spoolman.url ? 'Spoolman unreachable: ' + spoolman.url
+                  : 'Spoolman not configured'">🧵{{ spoolman.active ? ' ✓' : '' }}</span>
   </header>
   <div v-if="rebootNeeded" class="reboot-banner">{{ t('ui.common.please_restart') }}</div>
   <main>
@@ -154,6 +159,8 @@
           <span>{{ t('ui.dashboard.toolheads') }}</span>
           <button class="unload-all-btn" @click="unloadAll()"
                   :disabled="isPrinting" :title="isPrinting ? t('ui.dashboard.blocked_printing') : ''">{{ t('ui.dashboard.unload_all') }}</button>
+          <button v-if="anyUnloading" class="cancel-unload-btn" @click="cancelUnloadAll()"
+                  title="Cancel after current toolhead">✕</button>
         </h3>
         <div class="toolhead-grid">
           <article v-for="t_ in state.toolheads" :key="t_.idx"
@@ -650,6 +657,33 @@ reboot</pre>
       </transition-group>
     </div>
   </div>
+  <!-- Spoolman spool picker modal -->
+  <div v-if="spoolPicker.show" class="overlay" @click.self="closeSpoolPicker">
+    <div class="dialog spoolman-dialog">
+      <h3>Spoolman — ACE {{ dispIdx(spoolPicker.ace) }} · Slot {{ dispIdx(spoolPicker.slot) }}</h3>
+      <div class="config-row" style="margin-bottom:.6rem">
+        <input type="search" v-model="spoolPicker.filter"
+               placeholder="Filter by material, brand or name…"
+               style="width:100%; padding:.4rem .6rem; border-radius:4px; border:1px solid var(--border); background:var(--input-bg,#1e2a2a); color:var(--fg); font-size:.9rem" autofocus>
+      </div>
+      <p v-if="spoolman.loading" class="muted">Loading spools…</p>
+      <div v-else-if="spoolPickerFiltered.length === 0" class="muted" style="padding:.5rem 0">No spools match.</div>
+      <div v-else class="spool-list">
+        <button v-for="sp in spoolPickerFiltered" :key="sp.id"
+                class="spool-item"
+                :style="spoolCardStyle(sp)"
+                @click="pickSpool(sp)">
+          <span class="spool-swatch"></span>
+          <span class="spool-desc">{{ spoolLabel(sp) }} <span class="muted small">#{{ sp.id }}</span></span>
+        </button>
+      </div>
+      <div class="row" style="margin-top:.8rem">
+        <button @click="closeSpoolPicker">Cancel</button>
+        <button v-if="spoolPickerSlotHasOverride" class="warn" @click="clearSpoolPickerOverride"
+                title="Remove the current spool override from this slot">✕ Clear spool</button>
+      </div>
+    </div>
+  </div>
   <div v-if="picker.show" class="overlay" @click.self="closePicker">
     <div class="dialog">
       <h3>
@@ -692,6 +726,8 @@ reboot</pre>
       </div>
       <div class="row">
         <button @click="closePicker">{{ t('ui.common.cancel') }}</button>
+        <button v-if="spoolman.active && (picker.head === null || picker.head === undefined)"
+                @click="openSpoolPickerFromPicker()">🧵 Spoolman</button>
         <button @click="savePicker(false)" class="primary">{{ t('ui.dialog.picker_save') }}</button>
         <button v-if="picker.head === null || picker.head === undefined"
                 @click="savePicker(true)" :disabled="isToolheadOccupied(picker.ace, picker.slot)">{{ t('ui.dialog.picker_load_after') }}</button>
