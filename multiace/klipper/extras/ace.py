@@ -662,6 +662,7 @@ class MultiAce:
             'ACE_UNLOAD_ALL_CANCEL', self.cmd_ACE_UNLOAD_ALL_CANCEL,
             desc='[multiACE] Cancel a running ACE_UNLOAD_ALL_HEADS after the current toolhead')
         self.gcode.register_command(
+            'ACE_TEST', self.cmd_ACE_TEST,
             desc=self.cmd_ACE_TEST_help)
         self.gcode.register_command(
             'ACE_DWELL_TEST', self.cmd_ACE_DWELL_TEST,
