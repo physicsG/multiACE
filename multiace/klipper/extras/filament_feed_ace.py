@@ -1809,6 +1809,7 @@ class FilamentFeed:
 
                 if self.ace is not None:
                     self.ace._ensure_active_ace_for_head(self.filament_ch[ch])
+                    self.ace._check_calibration_unload_cancel()
 
                 if self.ace is not None \
                         and self.ace.head_uses_ace(self.filament_ch[ch]):
@@ -1881,6 +1882,8 @@ class FilamentFeed:
                                     "for tip-form", _precool)
                             self.gcode.run_script_from_command("M109 S%d\r\n" % (filament_unload_temp))
                             self.toolhead.wait_moves()
+                            if self.ace is not None:
+                                self.ace._check_calibration_unload_cancel()
                         except:
                             self.channel_error[ch] = FEED_ERR_HEAT
                             raise
@@ -1898,6 +1901,8 @@ class FilamentFeed:
 
                 elif stage == FEED_UNLOAD_STAGE_DOING:
                     try:
+                        if self.ace is not None:
+                            self.ace._check_calibration_unload_cancel()
 
                         _stable_states = [
                             FEED_STA_UNLOAD_HEAT_FINISH,
@@ -1930,6 +1935,7 @@ class FilamentFeed:
                                 int(filament_soft),
                                 self.toolhead.get_extruder().nozzle_diameter)
                             self.toolhead.wait_moves()
+                            self.ace._check_calibration_unload_cancel()
                         except:
                             self.channel_error[ch] = FEED_ERR_CUSTOM_GCODE
                             raise ValueError('custom gcode error!')
@@ -1992,6 +1998,7 @@ class FilamentFeed:
                                     ace=self.ace._disp(_gate_ace),
                                     slot=self.ace._disp(_ace_slot)))
                             for unload_attempt in range(unload_max):
+                                self.ace._check_calibration_unload_cancel()
                                 self.ace.wait_ace_ready()
                                 _usp = self.ace._retract_with_decoder_span(
                                     self.ace._active_device_index, _ace_slot,
@@ -1999,6 +2006,7 @@ class FilamentFeed:
                                         _ace_slot, _short_retract,
                                         _retract_speed, head=head_idx))
                                 self.ace.wait_ace_ready()
+                                self.ace._check_calibration_unload_cancel()
                                 self._unload_dec_log(
                                     head_idx, _ace_slot, 'short', _short_retract,
                                     _usp, unload_attempt + 1)
@@ -2047,6 +2055,7 @@ class FilamentFeed:
                                     except:
                                         logging.info("[feed][unload] forward probe failed")
                                     self.reactor.pause(self.reactor.monotonic() + FEED_UNLOAD_TRIGGER_SETTLE)
+                                    self.ace._check_calibration_unload_cancel()
                                     try:
                                         _pin = getattr(self.runout_sensor[ch],
                                                        'runout_buttun_state', None)
@@ -2087,6 +2096,7 @@ class FilamentFeed:
                                     except:
                                         logging.info("[feed][unload] probe pull-back failed")
                                 try:
+                                    self.ace._check_calibration_unload_cancel()
                                     if precool_temp > 0:
                                         self.gcode.run_script_from_command("M104 S%d\r\n" % precool_temp)
                                         self.gcode.run_script_from_command(
@@ -2103,12 +2113,14 @@ class FilamentFeed:
                                         int(filament_soft),
                                         self.toolhead.get_extruder().nozzle_diameter)
                                     self.toolhead.wait_moves()
+                                    self.ace._check_calibration_unload_cancel()
                                     self.gcode.run_script_from_command("M104 S%d\r\n" % probe_temp)
                                 except:
                                     logging.info("[feed][unload] toolhead unload retry failed")
                             if unload_ok:
                                 _rest = _full_retract - _short_retract
                                 if _rest > 0:
+                                    self.ace._check_calibration_unload_cancel()
                                     self.ace.wait_ace_ready()
                                     _rsp = self.ace._retract_with_decoder_span(
                                         self.ace._active_device_index, _ace_slot,
@@ -2116,6 +2128,7 @@ class FilamentFeed:
                                             _ace_slot, _rest,
                                             _retract_speed, head=head_idx))
                                     self.ace.wait_ace_ready()
+                                    self.ace._check_calibration_unload_cancel()
                                     self._unload_dec_log(
                                         head_idx, _ace_slot, 'rest', _rest,
                                         _rsp, '-')

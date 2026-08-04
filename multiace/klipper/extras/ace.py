@@ -446,6 +446,22 @@ class MultiAce:
         self._last_swap_result = None
         self._event_seq = 0
 
+        # Bowden-path calibration is deliberately separate from FEED_AUTO:
+        # it never heats, extrudes, purges, or mutates head_source/material
+        # bookkeeping. The reactor timer keeps every move cancellable.
+        self._calibration = self._calibration_idle_state()
+        self._calibration_timer = None
+        self._calibration_move = None
+        self._calibration_prev_ace = None
+        self._calibration_seq = 0
+        self._calibration_unload = {
+            'active': False, 'head': None, 'ace': None, 'slot': None,
+            'cancel_requested': False,
+        }
+        self.printer.lookup_object('webhooks').register_endpoint(
+            'multiace/calibration_unload_cancel',
+            self._handle_calibration_unload_cancel)
+
         self._v2_active_rev_assist = False
         self._test_cancel = False
         self._unload_all_cancel = False
@@ -620,6 +636,30 @@ class MultiAce:
         self.gcode.register_command(
             'ACE_RETRACT', self.cmd_ACE_RETRACT,
             desc=self.cmd_ACE_RETRACT_help)
+        self.gcode.register_command(
+            'ACE_CALIBRATION_START', self.cmd_ACE_CALIBRATION_START,
+            desc=self.cmd_ACE_CALIBRATION_START_help)
+        self.gcode.register_command(
+            'ACE_CALIBRATION_FEED', self.cmd_ACE_CALIBRATION_FEED,
+            desc=self.cmd_ACE_CALIBRATION_FEED_help)
+        self.gcode.register_command(
+            'ACE_CALIBRATION_RETRACT', self.cmd_ACE_CALIBRATION_RETRACT,
+            desc=self.cmd_ACE_CALIBRATION_RETRACT_help)
+        self.gcode.register_command(
+            'ACE_CALIBRATION_MARK', self.cmd_ACE_CALIBRATION_MARK,
+            desc=self.cmd_ACE_CALIBRATION_MARK_help)
+        self.gcode.register_command(
+            'ACE_CALIBRATION_RETURN', self.cmd_ACE_CALIBRATION_RETURN,
+            desc=self.cmd_ACE_CALIBRATION_RETURN_help)
+        self.gcode.register_command(
+            'ACE_CALIBRATION_VERIFY', self.cmd_ACE_CALIBRATION_VERIFY,
+            desc=self.cmd_ACE_CALIBRATION_VERIFY_help)
+        self.gcode.register_command(
+            'ACE_CALIBRATION_CANCEL', self.cmd_ACE_CALIBRATION_CANCEL,
+            desc=self.cmd_ACE_CALIBRATION_CANCEL_help)
+        self.gcode.register_command(
+            'ACE_CALIBRATION_RESET', self.cmd_ACE_CALIBRATION_RESET,
+            desc=self.cmd_ACE_CALIBRATION_RESET_help)
 
         self.gcode.register_command(
             'ACE_SWITCH', self.cmd_ACE_SWITCH,
@@ -1530,6 +1570,7 @@ class MultiAce:
         return eventtime + 2.0
 
     def _handle_disconnect(self):
+        self._calibration_abort('klippy disconnected', restore=False)
         logging.info('[multiACE] Closing all ACE connections')
         for idx in list(self._serials.keys()):
             try:
@@ -1968,6 +2009,7 @@ class MultiAce:
             return False
 
     def _on_print_start(self, *args):
+        self._calibration_abort('print started')
         self._print_has_gcode_loads = self._sniff_print_gcode_loads()
         logging.info('[multiACE] print gcode carries multiACE loads: %s'
                      % self._print_has_gcode_loads)
@@ -4853,6 +4895,1172 @@ class MultiAce:
             request={"method": "stop_feed_filament", "params": {"index": index}},
             callback=callback)
 
+    # ------------------------------------------------------------------
+    # Bowden path calibration
+
+    def _calibration_idle_state(self):
+        return {
+            'state': 'idle',
+            'session_id': 0,
+            'ace': None,
+            'slot': None,
+            'head': None,
+            'scope': 'ace',
+            'protocol': '',
+            'commanded_feed_mm': 0,
+            'commanded_retract_mm': 0,
+            'load_length_mm': None,
+            'swap_retract_length_mm': None,
+            'retract_length_mm': None,
+            'decoder_span': None,
+            'feed_decoder_span': None,
+            'return_decoder_span': None,
+            'decoder_return_delta': None,
+            'park_reference': 'ace_preload',
+            'tip_position_mm': None,
+            'verify_phase': 'unavailable',
+            'verify_position_mm': None,
+            'verify_paused_from': None,
+            'verify_feed_actual_mm': None,
+            'verify_feed_delta_mm': None,
+            'verify_fine_offset_mm': 0,
+            'verify_fine_limit_mm': 50,
+            'verify_decoder_span': None,
+            'verify_move_seq': 0,
+            'toolhead_sensor': None,
+            'max_feed_mm': 0,
+            'speed_mm_s': 0,
+            'previous_load_length': None,
+            'previous_swap_retract_length': None,
+            'previous_retract_length': None,
+            'error': None,
+        }
+
+    def _calibration_sensor(self, head):
+        sensor = self.printer.lookup_object(
+            'filament_motion_sensor e%d_filament' % int(head), None)
+        if sensor is None:
+            return None
+        try:
+            return bool(sensor.get_status(0).get('filament_detected'))
+        except Exception:
+            return None
+
+    def _calibration_prepare_unload_source(self, gcmd, head, ace, slot):
+        if ace is None or slot is None:
+            raise gcmd.error(
+                '[multiACE] calibration preparation requires the selected '
+                'ACE and SLOT')
+        if not (0 <= ace < len(self._ace_devices)):
+            raise gcmd.error(
+                '[multiACE] calibration preparation ACE out of range')
+        if slot < 0 or slot > 3:
+            raise gcmd.error(
+                '[multiACE] calibration preparation SLOT must be 0-3')
+        if getattr(self, '_ace_mode', 'normal') == 'normal':
+            raise gcmd.error(
+                '[multiACE] switch to multi or head mode first')
+        if self.head_is_manual(head) or not self.head_uses_ace(head):
+            raise gcmd.error(
+                '[multiACE] selected head is not ACE-driven')
+        mode = getattr(self, '_ace_mode', 'multi')
+        if mode == 'multi' and slot != head:
+            raise gcmd.error(
+                '[multiACE] multi mode preparation requires SLOT=HEAD')
+        if mode == 'head' and self.head_ace_for(head) != ace:
+            raise gcmd.error(
+                '[multiACE] selected head is wired to a different ACE')
+
+        ps = self.printer.lookup_object('print_stats', None)
+        ps_state = (getattr(ps, 'state', '') or '').lower()
+        if ps_state in ('printing', 'paused'):
+            raise gcmd.error(
+                '[multiACE] calibration preparation requires an idle printer')
+        if self._swap_in_progress:
+            raise gcmd.error(
+                '[multiACE] cannot prepare calibration during a swap')
+        bg = self.printer.lookup_object('ace_bg_swap', None)
+        if bg is not None and getattr(bg, '_busy', None):
+            raise gcmd.error(
+                '[multiACE] background load/unload is active')
+        if self._calibration_unload.get('active'):
+            raise gcmd.error(
+                '[multiACE] calibration preparation unload already active')
+        if not self._ensure_ace_available(ace):
+            raise gcmd.error(
+                '[multiACE] selected ACE is not connected')
+
+        gates = self._gate_status_per_ace.get(ace) or []
+        if slot >= len(gates) or gates[slot] != GATE_AVAILABLE:
+            raise gcmd.error(
+                '[multiACE] selected slot is not at its ACE preload '
+                'reference')
+
+        c = self._calibration
+        if c.get('state') in (
+                'feeding', 'retracting', 'returning', 'verifying_feed',
+                'verifying_splitter', 'verifying_return',
+                'verify_toolhead_adjusting'):
+            raise gcmd.error(
+                '[multiACE] calibration movement is still active')
+        tip = c.get('tip_position_mm')
+        route_occupied = tip is not None and float(tip) > 0.0
+        if route_occupied and (
+                c.get('ace') != ace or c.get('slot') != slot
+                or c.get('head') != head):
+            raise gcmd.error(
+                '[multiACE] selected preparation route does not match the '
+                'occupied calibration route')
+
+        for other_head, other in self._head_source.items():
+            if other_head == head or not other:
+                continue
+            if (other.get('ace_index') == ace
+                    and other.get('slot') == slot):
+                raise gcmd.error(
+                    '[multiACE] selected ACE slot is already assigned to '
+                    'another toolhead')
+            if mode == 'head' and other.get('ace_index') == ace:
+                raise gcmd.error(
+                    '[multiACE] selected ACE already has another loaded '
+                    'toolhead route')
+
+        return {'ace_index': int(ace), 'slot': int(slot)}
+
+    def _calibration_unload_begin(self, head, ace, slot):
+        self._calibration_unload = {
+            'active': True, 'head': int(head), 'ace': int(ace),
+            'slot': int(slot), 'cancel_requested': False,
+        }
+
+    def _calibration_unload_finish(self):
+        self._calibration_unload = {
+            'active': False, 'head': None, 'ace': None, 'slot': None,
+            'cancel_requested': False,
+        }
+
+    def _calibration_unload_stop_hardware(self):
+        state = self._calibration_unload
+        ace, slot, head = state.get('ace'), state.get('slot'), state.get('head')
+        if isinstance(ace, int) and isinstance(slot, int):
+            for method in ('stop_feed_filament', 'stop_feed_assist'):
+                try:
+                    self.send_request_to(ace, {
+                        'method': method, 'params': {'index': slot}},
+                        lambda self, response: None)
+                except Exception:
+                    pass
+        try:
+            extruder = self.printer.lookup_object(
+                'extruder' if head == 0 else 'extruder%d' % head, None)
+            pheaters = self.printer.lookup_object('heaters', None)
+            if extruder is not None and pheaters is not None:
+                pheaters.set_temperature(extruder.get_heater(), 0.)
+        except Exception:
+            logging.exception(
+                '[multiACE] failed to turn heater off during calibration '
+                'unload cancellation')
+
+    def _handle_calibration_unload_cancel(self, web_request):
+        state = self._calibration_unload
+        if not state.get('active'):
+            web_request.send({'state': 'idle', 'cancelled': False})
+            return
+        state['cancel_requested'] = True
+        self._calibration_unload_stop_hardware()
+        logging.info('[multiACE] direct calibration unload cancel requested '
+                     'for head %s', state.get('head'))
+        web_request.send({'state': 'cancelling', 'cancelled': True})
+
+    def _check_calibration_unload_cancel(self):
+        if (self._calibration_unload.get('active')
+                and self._calibration_unload.get('cancel_requested')):
+            self._calibration_unload_stop_hardware()
+            raise self.printer.command_error(
+                '[multiACE] calibration preparation unload cancelled')
+
+    def _calibration_stop_timer(self):
+        timer = self._calibration_timer
+        self._calibration_timer = None
+        if timer is not None:
+            try:
+                self.reactor.unregister_timer(timer)
+            except Exception:
+                pass
+
+    def _calibration_send_stop(self):
+        c = self._calibration
+        idx, slot = c.get('ace'), c.get('slot')
+        if not isinstance(idx, int) or not isinstance(slot, int):
+            return
+        try:
+            self.send_request_to(idx, {
+                'method': 'stop_feed_filament',
+                'params': {'index': slot}}, lambda self, response: None)
+        except Exception:
+            pass
+
+    def _calibration_restore_active(self):
+        prev = self._calibration_prev_ace
+        self._calibration_prev_ace = None
+        if (isinstance(prev, int) and prev != self._active_device_index
+                and self._connected_per_ace.get(prev, False)):
+            try:
+                self._set_active_idx(prev)
+            except Exception:
+                pass
+
+    def _calibration_abort(self, reason, restore=True):
+        if not hasattr(self, '_calibration'):
+            return
+        c = self._calibration
+        if c.get('state') in (
+                'idle', 'cancelled', 'complete', 'verified', 'failed'):
+            return
+        self._calibration_send_stop()
+        self._calibration_stop_timer()
+        self._calibration_move = None
+        c['state'] = 'cancelled'
+        c['error'] = str(reason)
+        if c.get('head') is not None:
+            c['toolhead_sensor'] = self._calibration_sensor(c['head'])
+        if restore:
+            self._calibration_restore_active()
+        logging.info('[multiACE] calibration cancelled: %s', reason)
+
+    def _calibration_fail(self, message):
+        c = self._calibration
+        self._calibration_send_stop()
+        self._calibration_move = None
+        c['state'] = 'failed'
+        c['error'] = str(message)
+        if c.get('head') is not None:
+            c['toolhead_sensor'] = self._calibration_sensor(c['head'])
+        self._calibration_restore_active()
+        self.log_error('[multiACE] Calibration failed: %s' % message)
+
+    def _calibration_move_callback(self, response, session_id, move_id):
+        c = self._calibration
+        move = self._calibration_move
+        if (c.get('session_id') != session_id or move is None
+                or move.get('id') != move_id):
+            return
+        if response and response.get('code', 0) != 0:
+            move['error'] = response.get('msg') or 'ACE rejected movement'
+
+    def _calibration_sample_decoder(self, idx, slot, session_id, move_id):
+        def _cb(self, response, _sid=session_id, _mid=move_id,
+                _slot=slot):
+            c = self._calibration
+            move = self._calibration_move
+            if (c.get('session_id') != _sid or move is None
+                    or move.get('id') != _mid):
+                return
+            try:
+                rows = ((response or {}).get('result') or {}).get(
+                    'feed_info') or []
+                for row in rows:
+                    if int(row.get('index', -1)) != _slot:
+                        continue
+                    value = int(row.get('decoder', 0))
+                    if value >= (1 << 63):
+                        value -= (1 << 64)
+                    cur_min = move.get('decoder_min')
+                    cur_max = move.get('decoder_max')
+                    move['decoder_min'] = value if cur_min is None else min(
+                        cur_min, value)
+                    move['decoder_max'] = value if cur_max is None else max(
+                        cur_max, value)
+                    break
+            except Exception:
+                pass
+        try:
+            self.send_request_to(idx, {'method': 'get_feed_info'}, _cb)
+        except Exception:
+            pass
+
+    def _calibration_accumulate_decoder(self, move):
+        dmin, dmax = move.get('decoder_min'), move.get('decoder_max')
+        if dmin is None or dmax is None:
+            return
+        span = max(0, int(dmax) - int(dmin))
+        kind = str(move.get('kind') or '')
+        if kind.startswith('verify_'):
+            current = self._calibration.get('verify_decoder_span')
+            self._calibration['verify_decoder_span'] = span \
+                if current is None else int(current) + span
+            return
+        current = self._calibration.get('decoder_span')
+        self._calibration['decoder_span'] = span if current is None \
+            else int(current) + span
+        key = ('feed_decoder_span' if kind == 'feed'
+               else 'return_decoder_span')
+        current = self._calibration.get(key)
+        self._calibration[key] = span if current is None \
+            else int(current) + span
+
+    def _calibration_finish_return(self):
+        c = self._calibration
+        target = int(c.get('load_length_mm') or 0)
+        value = int(c.get('commanded_retract_mm') or 0)
+        if target <= 0 or value != target:
+            self._calibration_fail(
+                'return to ACE preload reference ended at the wrong distance')
+            return
+        c['retract_length_mm'] = target
+        feed_span = c.get('feed_decoder_span')
+        return_span = c.get('return_decoder_span')
+        if feed_span is not None and return_span is not None:
+            c['decoder_return_delta'] = abs(
+                int(feed_span) - int(return_span))
+        c['state'] = 'complete'
+        c['verify_phase'] = 'ready'
+        c['verify_position_mm'] = 0
+        c['tip_position_mm'] = 0
+        c['toolhead_sensor'] = self._calibration_sensor(c['head'])
+        c['error'] = None
+        self._calibration_move = None
+        self._calibration_restore_active()
+        self.log_always(
+            '[multiACE] Calibration returned to ACE preload reference: '
+            'load=%d swap=%d retract=%d'
+            % (target, int(c.get('swap_retract_length_mm') or 0), target))
+
+    def _calibration_verify_position(self, eventtime, commit=False):
+        c = self._calibration
+        move = self._calibration_move
+        if move is None or not str(move.get('kind', '')).startswith('verify_'):
+            return int(c.get('verify_position_mm') or 0)
+        elapsed = max(0.0, eventtime - float(move['started']))
+        travelled = min(float(move['length']),
+                        elapsed * float(move['speed']))
+        position = (float(move.get('position_start', 0))
+                    + float(move.get('direction', 1)) * travelled)
+        load = int(c.get('load_length_mm') or 0)
+        if str(move.get('kind', '')).startswith('verify_adjust'):
+            fine_limit = int(c.get('verify_fine_limit_mm') or 50)
+            lower = max(0, load - fine_limit)
+            upper = load + fine_limit
+        else:
+            lower, upper = 0, load
+        position = max(float(lower), min(float(upper), position))
+        c['verify_position_mm'] = int(round(position))
+        c['tip_position_mm'] = c['verify_position_mm']
+        if commit:
+            self._calibration_accumulate_decoder(move)
+            self._calibration_move = None
+        return c['verify_position_mm']
+
+    def _calibration_verify_hold_toolhead(self, eventtime):
+        c = self._calibration
+        actual = self._calibration_verify_position(eventtime, commit=True)
+        target = int(c.get('load_length_mm') or 0)
+        c['verify_feed_actual_mm'] = actual
+        c['verify_feed_delta_mm'] = actual - target
+        c['verify_fine_offset_mm'] = actual - target
+        c['verify_position_mm'] = target
+        c['tip_position_mm'] = target
+        c['verify_phase'] = 'toolhead'
+        c['state'] = 'verify_toolhead'
+        c['toolhead_sensor'] = True
+        self._calibration_send_stop()
+        self._calibration_timer = None
+        self.log_always(
+            '[multiACE] Verification paused at toolhead sensor '
+            '(actual~%dmm, calibrated=%dmm)' % (actual, target))
+
+    def _calibration_verify_enter_adjust(self):
+        c = self._calibration
+        target = int(c.get('load_length_mm') or 0)
+        c['verify_position_mm'] = target
+        c['tip_position_mm'] = target
+        c['verify_feed_actual_mm'] = target
+        c['verify_feed_delta_mm'] = 0
+        c['verify_fine_offset_mm'] = 0
+        c['verify_phase'] = 'toolhead_adjust'
+        c['state'] = 'verify_toolhead_adjust'
+        c['toolhead_sensor'] = False
+        c['error'] = None
+        self._calibration_move = None
+        self._calibration_timer = None
+        self.log_always(
+            '[multiACE] Verification reached the calibrated toolhead '
+            'endpoint with the sensor clear; bounded fine positioning '
+            'is available')
+
+    def _calibration_verify_hold_after_adjust(self, eventtime):
+        c = self._calibration
+        actual = self._calibration_verify_position(eventtime, commit=True)
+        target = int(c.get('load_length_mm') or 0)
+        offset = actual - target
+        c['verify_feed_actual_mm'] = actual
+        c['verify_feed_delta_mm'] = offset
+        c['verify_fine_offset_mm'] = offset
+        c['verify_position_mm'] = actual
+        c['tip_position_mm'] = actual
+        c['verify_phase'] = 'toolhead'
+        c['state'] = 'verify_toolhead'
+        c['toolhead_sensor'] = True
+        self._calibration_send_stop()
+        self._calibration_timer = None
+        self.log_always(
+            '[multiACE] Verification fine positioning reached the '
+            'toolhead sensor at %+dmm' % offset)
+
+    def _calibration_verify_dispatch(self, eventtime, state):
+        c = self._calibration
+        position = int(c.get('verify_position_mm') or 0)
+        load = int(c.get('load_length_mm') or 0)
+        if state == 'verifying_feed':
+            remaining = load - position
+            if remaining <= 0:
+                if self._calibration_sensor(c['head']):
+                    self._calibration_verify_hold_toolhead(eventtime)
+                else:
+                    self._calibration_verify_enter_adjust()
+                return False
+            # Verification is a continuous traversal, unlike measurement:
+            # command the complete remaining route and keep polling the
+            # sensor so the move can still be stopped immediately.
+            length = remaining
+            kind, method, direction = 'verify_feed', 'feed_filament', 1
+            speed = c['speed_mm_s']
+        elif state == 'verifying_splitter':
+            target = load - int(c.get('swap_retract_length_mm') or 0)
+            remaining = position - target
+            if remaining <= 0:
+                c['verify_position_mm'] = target
+                c['tip_position_mm'] = target
+                c['verify_phase'] = 'splitter'
+                c['state'] = 'verify_splitter'
+                self._calibration_timer = None
+                return False
+            length = remaining
+            kind = 'verify_splitter'
+            method, direction = 'unwind_filament', -1
+            speed = min(30, self.get_retract_speed(c['ace']))
+        else:
+            remaining = position
+            if remaining <= 0:
+                if self._calibration_sensor(c['head']) is True:
+                    self._calibration_fail(
+                        'toolhead sensor remained triggered after the '
+                        'verification return')
+                    self._calibration_timer = None
+                    return False
+                c['verify_position_mm'] = 0
+                c['tip_position_mm'] = 0
+                c['verify_phase'] = 'verified'
+                c['state'] = 'verified'
+                c['error'] = None
+                self._calibration_timer = None
+                self._calibration_restore_active()
+                self.log_always(
+                    '[multiACE] Verification round trip complete')
+                return False
+            length = remaining
+            kind, method, direction = 'verify_return', 'unwind_filament', -1
+            speed = min(30, self.get_retract_speed(c['ace']))
+        c['verify_move_seq'] = int(c.get('verify_move_seq') or 0) + 1
+        move_id = c['verify_move_seq']
+        move = {
+            'id': move_id, 'kind': kind, 'length': int(length),
+            'speed': speed, 'started': eventtime,
+            'position_start': position, 'direction': direction,
+            'decoder_min': None, 'decoder_max': None,
+            'next_decoder_sample': eventtime, 'error': None,
+        }
+        self._calibration_move = move
+        try:
+            self.send_request_to(c['ace'], {
+                'method': method,
+                'params': {'index': c['slot'], 'length': int(length),
+                           'speed': speed}},
+                lambda self, response, _sid=c['session_id'], _mid=move_id:
+                    self._calibration_move_callback(response, _sid, _mid))
+        except Exception as e:
+            self._calibration_fail(
+                'failed to start verification movement: %s' % e)
+            return False
+        return True
+
+    def _calibration_verify_timer_tick(self, eventtime):
+        c = self._calibration
+        state = c.get('state')
+        idx, head = c['ace'], c['head']
+        move = self._calibration_move
+        c['toolhead_sensor'] = self._calibration_sensor(head)
+        if state == 'verifying_feed' and c['toolhead_sensor'] is True:
+            self._calibration_verify_hold_toolhead(eventtime)
+            return self.reactor.NEVER
+        if (state == 'verify_toolhead_adjusting'
+                and c['toolhead_sensor'] is True):
+            self._calibration_verify_hold_after_adjust(eventtime)
+            return self.reactor.NEVER
+        if move is not None:
+            self._calibration_verify_position(eventtime)
+            if move.get('error'):
+                self._calibration_fail(move['error'])
+                self._calibration_timer = None
+                return self.reactor.NEVER
+            if (c.get('protocol') == 'v2'
+                    and eventtime >= move.get('next_decoder_sample', 0)):
+                move['next_decoder_sample'] = eventtime + 0.25
+                self._calibration_sample_decoder(
+                    idx, c['slot'], c['session_id'], move['id'])
+            elapsed = eventtime - move['started']
+            expected = float(move['length']) / max(float(move['speed']), 1.)
+            ready = (self._info_per_ace.get(idx, {}) or {}).get(
+                'status') == 'ready'
+            if ready and elapsed >= max(0.15, expected * 0.80):
+                c['verify_position_mm'] = int(
+                    move.get('position_start', 0)
+                    + move.get('direction', 1) * move['length'])
+                c['tip_position_mm'] = c['verify_position_mm']
+                self._calibration_accumulate_decoder(move)
+                self._calibration_move = None
+                if state == 'verify_toolhead_adjusting':
+                    offset = (int(c['verify_position_mm'])
+                              - int(c.get('load_length_mm') or 0))
+                    c['verify_fine_offset_mm'] = offset
+                    c['verify_feed_actual_mm'] = c['verify_position_mm']
+                    c['verify_feed_delta_mm'] = offset
+                    limit = int(c.get('verify_fine_limit_mm') or 50)
+                    if abs(offset) >= limit:
+                        self._calibration_fail(
+                            'toolhead sensor was not reached within the '
+                            'verification fine-position limit')
+                        self._calibration_timer = None
+                        return self.reactor.NEVER
+                    c['state'] = 'verify_toolhead_adjust'
+                    c['verify_phase'] = 'toolhead_adjust'
+                    self._calibration_timer = None
+                    return self.reactor.NEVER
+                return eventtime + 0.05
+            if elapsed > expected + 8.0:
+                self._calibration_fail('verification movement timed out')
+                self._calibration_timer = None
+                return self.reactor.NEVER
+            return eventtime + 0.05
+        if (self._info_per_ace.get(idx, {}) or {}).get('status') != 'ready':
+            return eventtime + 0.10
+        if not self._calibration_verify_dispatch(eventtime, state):
+            return self.reactor.NEVER
+        return eventtime + 0.05
+
+    def _calibration_finish_feed(self, eventtime):
+        c = self._calibration
+        move = self._calibration_move
+        partial = 0.0
+        if move is not None:
+            elapsed = max(0.0, eventtime - move['started'])
+            partial = min(float(move['length']),
+                          elapsed * float(move['speed']))
+            self._calibration_accumulate_decoder(move)
+        c['commanded_feed_mm'] = int(round(
+            float(c.get('commanded_feed_mm', 0)) + partial))
+        c['load_length_mm'] = c['commanded_feed_mm']
+        c['tip_position_mm'] = c['load_length_mm']
+        c['toolhead_sensor'] = True
+        c['state'] = 'at_sensor'
+        c['error'] = None
+        self._calibration_move = None
+        self._calibration_send_stop()
+        self.log_always(
+            '[multiACE] Calibration load sensor reached at ~%dmm '
+            '(ACE %d slot %d -> head %d)'
+            % (c['load_length_mm'], c['ace'], c['slot'], c['head']))
+
+    def _calibration_timer_tick(self, eventtime):
+        c = self._calibration
+        state = c.get('state')
+        verify_moving = (
+            'verifying_feed', 'verifying_splitter', 'verifying_return',
+            'verify_toolhead_adjusting')
+        if state in verify_moving:
+            idx = c.get('ace')
+            if not self._connected_per_ace.get(idx, False):
+                self._calibration_fail('selected ACE disconnected')
+                self._calibration_timer = None
+                return self.reactor.NEVER
+            return self._calibration_verify_timer_tick(eventtime)
+        if state not in ('feeding', 'retracting', 'returning'):
+            self._calibration_timer = None
+            return self.reactor.NEVER
+        idx, slot, head = c['ace'], c['slot'], c['head']
+        if not self._connected_per_ace.get(idx, False):
+            self._calibration_fail('selected ACE disconnected')
+            self._calibration_timer = None
+            return self.reactor.NEVER
+
+        detected = self._calibration_sensor(head)
+        c['toolhead_sensor'] = detected
+        move = self._calibration_move
+
+        if state == 'feeding' and detected is True:
+            self._calibration_finish_feed(eventtime)
+            self._calibration_timer = None
+            return self.reactor.NEVER
+
+        if move is not None:
+            if state == 'feeding':
+                elapsed = max(0.0, eventtime - float(move['started']))
+                partial = min(float(move['length']),
+                              elapsed * float(move['speed']))
+                c['tip_position_mm'] = max(0, int(round(
+                    int(c.get('commanded_feed_mm') or 0) + partial)))
+            elif state in ('retracting', 'returning'):
+                elapsed = max(0.0, eventtime - float(move['started']))
+                partial = min(float(move['length']),
+                              elapsed * float(move['speed']))
+                c['tip_position_mm'] = max(0, int(round(
+                    int(c.get('load_length_mm') or 0)
+                    - int(c.get('commanded_retract_mm') or 0)
+                    - partial)))
+            if move.get('error'):
+                self._calibration_fail(move['error'])
+                self._calibration_timer = None
+                return self.reactor.NEVER
+            if (c.get('protocol') == 'v2'
+                    and eventtime >= move.get('next_decoder_sample', 0)):
+                move['next_decoder_sample'] = eventtime + 0.25
+                self._calibration_sample_decoder(
+                    idx, slot, c['session_id'], move['id'])
+            elapsed = eventtime - move['started']
+            info = self._info_per_ace.get(idx, {}) or {}
+            ready = info.get('status') == 'ready'
+            expected = float(move['length']) / max(float(move['speed']), 1.)
+            # The cached status can still read ready immediately after a
+            # command is queued. Never complete a chunk until enough motion
+            # time has elapsed for the heartbeat to observe busy -> ready.
+            if ready and elapsed >= max(0.15, expected * 0.80):
+                self._calibration_accumulate_decoder(move)
+                if state == 'feeding':
+                    c['commanded_feed_mm'] = int(
+                        c.get('commanded_feed_mm', 0)) + int(move['length'])
+                    self._calibration_move = None
+                    if c['commanded_feed_mm'] >= c['max_feed_mm']:
+                        self._calibration_fail(
+                            'toolhead sensor not reached before feed limit')
+                        self._calibration_timer = None
+                        return self.reactor.NEVER
+                    return eventtime + 0.05
+                c['commanded_retract_mm'] = int(
+                    c.get('commanded_retract_mm', 0)) + int(move['length'])
+                c['tip_position_mm'] = max(
+                    0, int(c.get('load_length_mm') or 0)
+                    - int(c['commanded_retract_mm']))
+                self._calibration_move = None
+                if state == 'returning':
+                    if (int(c['commanded_retract_mm']) >=
+                            int(c.get('load_length_mm') or 0)):
+                        self._calibration_finish_return()
+                        self._calibration_timer = None
+                        return self.reactor.NEVER
+                    return eventtime + 0.05
+                c['state'] = ('swap_marked'
+                              if c.get('swap_retract_length_mm') is not None
+                              else 'retract_ready')
+                c['toolhead_sensor'] = self._calibration_sensor(head)
+                self._calibration_timer = None
+                return self.reactor.NEVER
+            if elapsed > expected + 8.0:
+                self._calibration_fail('ACE movement timed out')
+                self._calibration_timer = None
+                return self.reactor.NEVER
+            return eventtime + 0.05
+
+        info = self._info_per_ace.get(idx, {}) or {}
+        if info.get('status') != 'ready':
+            return eventtime + 0.10
+        if state == 'returning':
+            remaining = (int(c.get('load_length_mm') or 0)
+                         - int(c.get('commanded_retract_mm') or 0))
+            if remaining <= 0:
+                self._calibration_finish_return()
+                self._calibration_timer = None
+                return self.reactor.NEVER
+            length = min(500, remaining)
+            kind = 'return'
+            method = 'unwind_filament'
+            speed = min(30, self.get_retract_speed(idx))
+            move_id = int(c.get('commanded_retract_mm', 0)) + 1
+        else:
+            remaining = int(c['max_feed_mm']) - int(c['commanded_feed_mm'])
+            length = min(500 if not c.get('commanded_feed_mm') else 100,
+                         remaining)
+            kind = 'feed'
+            method = 'feed_filament'
+            speed = c['speed_mm_s']
+            move_id = int(c.get('commanded_feed_mm', 0)) + 1
+        if remaining <= 0:
+            self._calibration_fail(
+                'toolhead sensor not reached before feed limit')
+            self._calibration_timer = None
+            return self.reactor.NEVER
+        move = {
+            'id': move_id, 'kind': kind, 'length': length,
+            'speed': speed, 'started': eventtime,
+            'decoder_min': None, 'decoder_max': None,
+            'next_decoder_sample': eventtime, 'error': None,
+        }
+        self._calibration_move = move
+        try:
+            self.send_request_to(idx, {
+                'method': method,
+                'params': {'index': slot, 'length': length,
+                           'speed': speed}},
+                lambda self, response, _sid=c['session_id'], _mid=move_id:
+                    self._calibration_move_callback(response, _sid, _mid))
+        except Exception as e:
+            self._calibration_fail('failed to start feed: %s' % e)
+            self._calibration_timer = None
+            return self.reactor.NEVER
+        return eventtime + 0.05
+
+    def _calibration_arm_timer(self):
+        self._calibration_stop_timer()
+        self._calibration_timer = self.reactor.register_timer(
+            self._calibration_timer_tick, self.reactor.NOW)
+
+    cmd_ACE_CALIBRATION_START_help = (
+        '[multiACE] Start Bowden calibration. '
+        'ACE_CALIBRATION_START ACE=0 SLOT=0 HEAD=0 SCOPE=ace|slot')
+    def cmd_ACE_CALIBRATION_START(self, gcmd):
+        if self._calibration.get('state') in (
+                'feeding', 'retracting', 'returning',
+                'verifying_feed', 'verifying_splitter',
+                'verifying_return', 'verify_toolhead_adjusting'):
+            raise gcmd.error('[multiACE] calibration movement already active')
+        ace = gcmd.get_int('ACE')
+        slot = gcmd.get_int('SLOT')
+        head = gcmd.get_int('HEAD')
+        scope = (gcmd.get('SCOPE', 'ace') or 'ace').strip().lower()
+        if not (0 <= ace < len(self._ace_devices)):
+            raise gcmd.error('[multiACE] calibration ACE out of range')
+        if slot < 0 or slot > 3 or head < 0 or head > 3:
+            raise gcmd.error('[multiACE] calibration SLOT/HEAD must be 0-3')
+        if scope not in ('ace', 'slot'):
+            raise gcmd.error('[multiACE] calibration SCOPE must be ace or slot')
+        ps = self.printer.lookup_object('print_stats', None)
+        ps_state = (getattr(ps, 'state', '') or '').lower()
+        if ps_state in ('printing', 'paused'):
+            raise gcmd.error('[multiACE] calibration requires an idle printer')
+        if getattr(self, '_ace_mode', 'normal') == 'normal':
+            raise gcmd.error('[multiACE] switch to multi or head mode first')
+        if self._swap_in_progress:
+            raise gcmd.error('[multiACE] cannot calibrate during a swap')
+        bg = self.printer.lookup_object('ace_bg_swap', None)
+        if bg is not None and getattr(bg, '_busy', None):
+            raise gcmd.error('[multiACE] background load/unload is active')
+        if self.head_is_manual(head) or not self.head_uses_ace(head):
+            raise gcmd.error('[multiACE] selected head is not ACE-driven')
+        if getattr(self, '_ace_mode', 'multi') == 'multi' and slot != head:
+            raise gcmd.error(
+                '[multiACE] multi mode calibration requires SLOT=HEAD')
+        if (getattr(self, '_ace_mode', 'multi') == 'head'
+                and self.head_ace_for(head) != ace):
+            raise gcmd.error(
+                '[multiACE] selected head is wired to a different ACE')
+        if not self._ensure_ace_available(ace):
+            raise gcmd.error('[multiACE] selected ACE is not connected')
+        gates = self._gate_status_per_ace.get(ace) or []
+        if slot >= len(gates) or gates[slot] != GATE_AVAILABLE:
+            raise gcmd.error(
+                '[multiACE] insert filament and wait for ACE preload first')
+        detected = self._calibration_sensor(head)
+        if detected is None:
+            raise gcmd.error('[multiACE] selected toolhead sensor unavailable')
+        if detected:
+            raise gcmd.error(
+                '[multiACE] selected toolhead sensor already has filament')
+
+        self._calibration_abort('new calibration session')
+        self._calibration_prev_ace = self._active_device_index
+        if not self._switch_ace_for_head_target(ace):
+            raise gcmd.error('[multiACE] failed to activate selected ACE')
+        self._disable_feed_assist_all()
+        self.wait_ace_ready_on(ace)
+        proto = self._protocols.get(ace)
+        protocol = getattr(proto, 'NAME', '') if proto else ''
+        self._calibration_seq += 1
+        effective_load = self.get_load_length(ace, slot)
+        self._calibration = self._calibration_idle_state()
+        self._calibration.update({
+            'state': 'prepared',
+            'session_id': self._calibration_seq,
+            'ace': ace, 'slot': slot, 'head': head, 'scope': scope,
+            'protocol': protocol,
+            'toolhead_sensor': False,
+            'tip_position_mm': 0,
+            'max_feed_mm': min(5000, max(100, effective_load + 300)),
+            'speed_mm_s': min(30, self.get_feed_speed(ace)),
+            'previous_load_length': effective_load,
+            'previous_swap_retract_length':
+                self.get_swap_retract_length(ace, slot),
+            'previous_retract_length': self.get_retract_length(ace, slot),
+        })
+        self._calibration_move = None
+        self.log_always(
+            '[multiACE] Calibration prepared: ACE %d slot %d -> head %d '
+            '(%s scope, %s)'
+            % (ace, slot, head, scope, protocol or 'unknown protocol'))
+
+    cmd_ACE_CALIBRATION_FEED_help = (
+        '[multiACE] Feed a prepared calibration path to its toolhead sensor')
+    def cmd_ACE_CALIBRATION_FEED(self, gcmd):
+        c = self._calibration
+        if c.get('state') != 'prepared':
+            raise gcmd.error('[multiACE] calibration is not prepared')
+        if self._calibration_sensor(c['head']):
+            raise gcmd.error('[multiACE] toolhead sensor is already active')
+        c['state'] = 'feeding'
+        c['error'] = None
+        self._calibration_move = None
+        self._calibration_arm_timer()
+
+    cmd_ACE_CALIBRATION_RETRACT_help = (
+        '[multiACE] Calibration retract jog. LENGTH=5..500')
+    def cmd_ACE_CALIBRATION_RETRACT(self, gcmd):
+        c = self._calibration
+        if c.get('state') not in ('at_sensor', 'retract_ready', 'swap_marked'):
+            raise gcmd.error('[multiACE] calibration is not ready to retract')
+        length = gcmd.get_int('LENGTH')
+        if length < 5 or length > 500:
+            raise gcmd.error('[multiACE] calibration retract LENGTH must be 5-500')
+        if int(c.get('commanded_retract_mm', 0)) + length \
+                > int(c.get('load_length_mm') or 0):
+            raise gcmd.error(
+                '[multiACE] calibration retract would pass the ACE preload '
+                'reference')
+        self.wait_ace_ready_on(c['ace'])
+        move_id = int(c.get('commanded_retract_mm', 0)) + 1
+        now = self.reactor.monotonic()
+        move = {
+            'id': move_id, 'kind': 'retract', 'length': length,
+            'speed': min(30, self.get_retract_speed(c['ace'])),
+            'started': now,
+            'decoder_min': None, 'decoder_max': None,
+            'next_decoder_sample': now, 'error': None,
+        }
+        self._calibration_move = move
+        c['state'] = 'retracting'
+        try:
+            self.send_request_to(c['ace'], {
+                'method': 'unwind_filament',
+                'params': {'index': c['slot'], 'length': length,
+                           'speed': move['speed']}},
+                lambda self, response, _sid=c['session_id'], _mid=move_id:
+                    self._calibration_move_callback(response, _sid, _mid))
+        except Exception as e:
+            self._calibration_fail('failed to start retract: %s' % e)
+            raise gcmd.error('[multiACE] failed to start calibration retract')
+        self._calibration_arm_timer()
+
+    cmd_ACE_CALIBRATION_MARK_help = (
+        '[multiACE] Mark calibration checkpoint. MARK=swap|full')
+    def cmd_ACE_CALIBRATION_MARK(self, gcmd):
+        c = self._calibration
+        mark = (gcmd.get('MARK') or '').strip().lower()
+        if mark == 'swap':
+            if c.get('state') != 'retract_ready':
+                raise gcmd.error(
+                    '[multiACE] retract at least one step before marking swap')
+            value = int(c.get('commanded_retract_mm', 0))
+            if value <= 0:
+                raise gcmd.error('[multiACE] swap checkpoint must be positive')
+            if value >= int(c.get('load_length_mm') or 0):
+                raise gcmd.error(
+                    '[multiACE] splitter checkpoint must be before the ACE '
+                    'preload reference')
+            c['swap_retract_length_mm'] = value
+            c['state'] = 'swap_marked'
+            return
+        if mark == 'full':
+            if c.get('state') != 'swap_marked':
+                raise gcmd.error('[multiACE] mark swap checkpoint first')
+            value = int(c.get('commanded_retract_mm', 0))
+            swap = int(c.get('swap_retract_length_mm') or 0)
+            target = int(c.get('load_length_mm') or 0)
+            if value <= swap or value != target:
+                raise gcmd.error(
+                    '[multiACE] full retract must match the measured ACE '
+                    'preload reference')
+            self._calibration_finish_return()
+            return
+        raise gcmd.error('[multiACE] MARK must be swap or full')
+
+    cmd_ACE_CALIBRATION_RETURN_help = (
+        '[multiACE] Return from the splitter checkpoint to the ACE preload '
+        'reference')
+    def cmd_ACE_CALIBRATION_RETURN(self, gcmd):
+        c = self._calibration
+        if c.get('state') != 'swap_marked':
+            raise gcmd.error('[multiACE] mark the splitter checkpoint first')
+        target = int(c.get('load_length_mm') or 0)
+        current = int(c.get('commanded_retract_mm') or 0)
+        if target <= 0 or current >= target:
+            raise gcmd.error(
+                '[multiACE] no safe distance remains to the preload reference')
+        c['state'] = 'returning'
+        c['error'] = None
+        self._calibration_move = None
+        self._calibration_arm_timer()
+
+    cmd_ACE_CALIBRATION_VERIFY_help = (
+        '[multiACE] Verify calibrated route. '
+        'ACTION=start|continue|pause|resume|jog [LENGTH=-10..10]')
+    def cmd_ACE_CALIBRATION_VERIFY(self, gcmd):
+        c = self._calibration
+        action = (gcmd.get('ACTION') or '').strip().lower()
+        moving = (
+            'verifying_feed', 'verifying_splitter', 'verifying_return')
+        if action == 'start':
+            configured_start = False
+            requested_ace = gcmd.get_int('ACE', None)
+            requested_slot = gcmd.get_int('SLOT', None)
+            requested_head = gcmd.get_int('HEAD', None)
+            route_values = (
+                requested_ace, requested_slot, requested_head)
+            route_supplied = any(value is not None for value in route_values)
+            if route_supplied and not all(
+                    value is not None for value in route_values):
+                raise gcmd.error(
+                    '[multiACE] verification route requires ACE, SLOT and '
+                    'HEAD')
+            requested_scope = (
+                (gcmd.get('SCOPE', 'ace') or 'ace').strip().lower())
+            route_changed = route_supplied and (
+                int(requested_ace) != c.get('ace')
+                or int(requested_slot) != c.get('slot')
+                or int(requested_head) != c.get('head')
+                or requested_scope != c.get('scope'))
+            current_position = c.get('tip_position_mm')
+            tip_away_from_park = (
+                current_position is not None
+                and float(current_position) > 0.0)
+            non_parked_state = c.get('state') in (
+                'feeding', 'at_sensor', 'retract_ready', 'retracting',
+                'swap_marked', 'returning', 'verifying_feed',
+                'verify_toolhead', 'verify_toolhead_adjust',
+                'verify_toolhead_adjusting', 'verifying_splitter',
+                'verify_splitter', 'verifying_return', 'verify_paused',
+                'cancelled', 'failed')
+            if route_changed and (tip_away_from_park or non_parked_state):
+                raise gcmd.error(
+                    '[multiACE] cannot change verification slot while the '
+                    'previous filament route is not parked; return or clear '
+                    'that route first')
+            if c.get('state') not in ('complete', 'verified') or route_changed:
+                if c.get('state') not in ('idle', 'cancelled', 'failed'):
+                    if not (route_changed
+                            and c.get('state') in ('complete', 'verified')):
+                        raise gcmd.error(
+                            '[multiACE] finish or cancel the current '
+                            'calibration before verification')
+                if not route_supplied:
+                    raise gcmd.error(
+                        '[multiACE] verification route requires ACE, SLOT '
+                        'and HEAD')
+                ace = int(requested_ace)
+                slot = int(requested_slot)
+                if not (0 <= ace < len(self._ace_devices)):
+                    raise gcmd.error('[multiACE] verification ACE out of range')
+                if slot < 0 or slot > 3:
+                    raise gcmd.error('[multiACE] verification SLOT must be 0-3')
+                configured_retract = int(
+                    self.get_retract_length(ace, slot) or 0)
+                configured_swap = int(
+                    self.get_swap_retract_length(ace, slot) or 0)
+                if (configured_retract <= 0 or configured_swap <= 0
+                        or configured_swap >= configured_retract):
+                    raise gcmd.error(
+                        '[multiACE] saved retract/splitter calibration is '
+                        'missing or invalid for this route')
+                # Reuse the full start guard (idle printer, selected route,
+                # fresh preload, clear toolhead sensor) before priming a
+                # transient session from the effective saved values.
+                self.cmd_ACE_CALIBRATION_START(gcmd)
+                c = self._calibration
+                c.update({
+                    'state': 'complete',
+                    'load_length_mm': configured_retract,
+                    'swap_retract_length_mm': configured_swap,
+                    'retract_length_mm': configured_retract,
+                    'verify_phase': 'ready',
+                    'verify_position_mm': 0,
+                    'tip_position_mm': 0,
+                })
+                configured_start = True
+            if c.get('state') not in ('complete', 'verified'):
+                raise gcmd.error(
+                    '[multiACE] complete calibration before verification')
+            load = int(c.get('load_length_mm') or 0)
+            swap = int(c.get('swap_retract_length_mm') or 0)
+            if load <= 0 or swap <= 0 or swap >= load:
+                raise gcmd.error(
+                    '[multiACE] calibrated route anchors are invalid')
+            detected = self._calibration_sensor(c['head'])
+            if detected is None:
+                raise gcmd.error(
+                    '[multiACE] selected toolhead sensor unavailable')
+            if detected:
+                raise gcmd.error(
+                    '[multiACE] toolhead sensor must be clear before verify')
+            if not self._ensure_ace_available(c['ace']):
+                raise gcmd.error('[multiACE] selected ACE is not connected')
+            if not configured_start:
+                self._calibration_prev_ace = self._active_device_index
+                if not self._switch_ace_for_head_target(c['ace']):
+                    raise gcmd.error(
+                        '[multiACE] failed to activate selected ACE')
+                self._disable_feed_assist_all()
+                self.wait_ace_ready_on(c['ace'])
+            c.update({
+                'state': 'verifying_feed',
+                'verify_phase': 'feed',
+                'verify_position_mm': 0,
+                'tip_position_mm': 0,
+                'verify_paused_from': None,
+                'verify_feed_actual_mm': None,
+                'verify_feed_delta_mm': None,
+                'verify_fine_offset_mm': 0,
+                'verify_fine_limit_mm': 50,
+                'verify_decoder_span': None,
+                'verify_move_seq': 0,
+                'toolhead_sensor': False,
+                'error': None,
+            })
+            self.log_always(
+                '[multiACE] Verification starting on ACE %d slot %d -> '
+                'head %d' % (c['ace'], c['slot'], c['head']))
+            self._calibration_move = None
+            self._calibration_arm_timer()
+            return
+        if action == 'jog':
+            if c.get('state') != 'verify_toolhead_adjust':
+                raise gcmd.error(
+                    '[multiACE] verification is not waiting for toolhead '
+                    'fine positioning')
+            delta = gcmd.get_int('LENGTH')
+            if abs(delta) not in (1, 2, 5, 10):
+                raise gcmd.error(
+                    '[multiACE] verification jog LENGTH must be '
+                    '+/-1, 2, 5, or 10 mm')
+            detected = self._calibration_sensor(c['head'])
+            if detected is None:
+                raise gcmd.error(
+                    '[multiACE] selected toolhead sensor unavailable')
+            if detected:
+                self._calibration_verify_hold_after_adjust(
+                    self.reactor.monotonic())
+                return
+            load = int(c.get('load_length_mm') or 0)
+            position = int(c.get('verify_position_mm') or load)
+            current_offset = position - load
+            target_offset = current_offset + delta
+            limit = int(c.get('verify_fine_limit_mm') or 50)
+            if abs(target_offset) > limit:
+                raise gcmd.error(
+                    '[multiACE] verification jog would exceed the '
+                    '+/-50 mm fine-position limit')
+            self.wait_ace_ready_on(c['ace'])
+            c['verify_move_seq'] = int(c.get('verify_move_seq') or 0) + 1
+            move_id = c['verify_move_seq']
+            direction = 1 if delta > 0 else -1
+            method = 'feed_filament' if delta > 0 else 'unwind_filament'
+            speed = min(30, (c.get('speed_mm_s') or 30))
+            now = self.reactor.monotonic()
+            move = {
+                'id': move_id,
+                'kind': ('verify_adjust_feed' if delta > 0
+                         else 'verify_adjust_retract'),
+                'length': abs(delta), 'speed': speed, 'started': now,
+                'position_start': position, 'direction': direction,
+                'decoder_min': None, 'decoder_max': None,
+                'next_decoder_sample': now, 'error': None,
+            }
+            self._calibration_move = move
+            c['state'] = 'verify_toolhead_adjusting'
+            c['verify_phase'] = 'toolhead_adjusting'
+            c['error'] = None
+            try:
+                self.send_request_to(c['ace'], {
+                    'method': method,
+                    'params': {'index': c['slot'], 'length': abs(delta),
+                               'speed': speed}},
+                    lambda self, response, _sid=c['session_id'],
+                    _mid=move_id: self._calibration_move_callback(
+                        response, _sid, _mid))
+            except Exception as e:
+                self._calibration_fail(
+                    'failed to start verification fine positioning: %s' % e)
+                raise gcmd.error(
+                    '[multiACE] failed to start verification jog')
+            self._calibration_arm_timer()
+            return
+        if action == 'continue':
+            if c.get('state') == 'verify_toolhead':
+                c['state'] = 'verifying_splitter'
+                c['verify_phase'] = 'splitter_move'
+            elif c.get('state') == 'verify_splitter':
+                c['state'] = 'verifying_return'
+                c['verify_phase'] = 'return'
+            else:
+                raise gcmd.error(
+                    '[multiACE] verification is not waiting at a checkpoint')
+            c['error'] = None
+            self._calibration_move = None
+            self._calibration_arm_timer()
+            return
+        if action == 'pause':
+            if c.get('state') not in moving:
+                raise gcmd.error('[multiACE] verification is not moving')
+            now = self.reactor.monotonic()
+            c['verify_position_mm'] = self._calibration_verify_position(
+                now, commit=True)
+            c['verify_paused_from'] = c['state']
+            c['state'] = 'verify_paused'
+            c['verify_phase'] = 'paused'
+            self._calibration_send_stop()
+            self._calibration_stop_timer()
+            return
+        if action == 'resume':
+            previous = c.get('verify_paused_from')
+            if c.get('state') != 'verify_paused' or previous not in moving:
+                raise gcmd.error('[multiACE] verification is not paused')
+            c['state'] = previous
+            c['verify_phase'] = {
+                'verifying_feed': 'feed',
+                'verifying_splitter': 'splitter_move',
+                'verifying_return': 'return',
+            }[previous]
+            c['verify_paused_from'] = None
+            self._calibration_move = None
+            self._calibration_arm_timer()
+            return
+        raise gcmd.error(
+            '[multiACE] verification ACTION must be '
+            'start, continue, pause, resume, or jog')
+
+    cmd_ACE_CALIBRATION_CANCEL_help = (
+        '[multiACE] Stop and cancel the active calibration')
+    def cmd_ACE_CALIBRATION_CANCEL(self, gcmd):
+        self._calibration_abort('cancelled by user')
+
+    cmd_ACE_CALIBRATION_RESET_help = (
+        '[multiACE] Clear a completed/failed/cancelled calibration session')
+    def cmd_ACE_CALIBRATION_RESET(self, gcmd):
+        if self._calibration.get('state') in (
+                'feeding', 'retracting', 'returning',
+                'verifying_feed', 'verifying_splitter',
+                'verifying_return', 'verify_toolhead_adjusting'):
+            raise gcmd.error('[multiACE] cancel active movement before reset')
+        self._calibration_restore_active()
+        self._calibration_stop_timer()
+        self._calibration_move = None
+        self._calibration = self._calibration_idle_state()
+
     cmd_ACE_SWITCH_help = 'Switch active ACE unit. Usage: ACE_SWITCH TARGET=0 [AUTOLOAD=1]'
 
     EXTRUDER_MAP = {
@@ -6700,6 +7908,7 @@ class MultiAce:
         return str(resp.get('msg', '')).strip().upper() == 'FORBIDDEN'
 
     def _run_tipform(self, head, temp, soft, nozzle_diameter):
+        self._check_calibration_unload_cancel()
         material = self._tipform_material_for(head)
         vendor = self._tipform_vendor_for(head)
         table = self.tipform_table_for(material, vendor=vendor, soft=bool(soft))
@@ -6717,6 +7926,7 @@ class MultiAce:
             self.gcode.run_script_from_command(
                 "INNER_FILAMENT_UNLOAD TEMP=%d SOFT=%d NOZZLE_DIAMETER=%f\r\n"
                 % (temp, soft, nozzle_diameter))
+            self._check_calibration_unload_cancel()
             return
         _tf_desc = (('%s %s' % (vendor, material)) if vendor and material
                     else (material.lower() if material else 'default'))
@@ -6748,6 +7958,7 @@ class MultiAce:
         fwd_armed = False
 
         def _tf_fa_start():
+            self._check_calibration_unload_cancel()
             try:
                 if self._v2_get_slot_status(ace_idx, slot) \
                         in V2_FA_RUNNING_STATES:
@@ -6756,6 +7967,7 @@ class MultiAce:
             except Exception:
                 pass
             for _a in range(3):
+                self._check_calibration_unload_cancel()
                 resp = self._tipform_send(ace_idx, {
                     'method': 'start_feed_assist', 'params': {'index': slot}})
                 if not self._tipform_rejected(resp):
@@ -6766,6 +7978,7 @@ class MultiAce:
 
         def _tf_unwind(ln):
             for _a in range(3):
+                self._check_calibration_unload_cancel()
                 self._tipform_send(ace_idx, {
                     'method': 'stop_feed_assist', 'params': {'index': slot}})
                 resp = self._tipform_send(ace_idx, {
@@ -6781,8 +7994,10 @@ class MultiAce:
         try:
             run('MOVE_TO_DISCARD_FILAMENT_POSITION')
             run('M109 S%d' % int(temp))
+            self._check_calibration_unload_cancel()
             run('M83')
             for tok in table:
+                self._check_calibration_unload_cancel()
                 kind = tok[0]
                 if kind == 'move':
                     mm, feed = float(tok[1]), int(tok[2])
@@ -6836,6 +8051,7 @@ class MultiAce:
                                 break
                             self.reactor.pause(
                                 self.reactor.monotonic() + 0.5)
+                            self._check_calibration_unload_cancel()
                 elif kind == 'fan':
                     run('M106 S%d' % int(tok[1]))
         finally:
@@ -7124,13 +8340,17 @@ class MultiAce:
 
     cmd_ACE_UNLOAD_HEAD_help = (
         '[multiACE] Unload a toolhead back to its ACE. '
-        'Usage: ACE_UNLOAD_HEAD HEAD=0 [RETRACT_LENGTH=<mm>] [KEEP_HEAT=<temp>]')
+        'Usage: ACE_UNLOAD_HEAD HEAD=0 [RETRACT_LENGTH=<mm>] '
+        '[KEEP_HEAT=<temp>] [CALIBRATION_PREPARE=1 ACE=0 SLOT=0]')
     def cmd_ACE_UNLOAD_HEAD(self, gcmd):
 
         head = gcmd.get_int('HEAD')
 
         retract_override = gcmd.get_int('RETRACT_LENGTH', 0)
         keep_heat = gcmd.get_int('KEEP_HEAT', 0)
+        calibration_prepare = bool(gcmd.get_int('CALIBRATION_PREPARE', 0))
+        requested_ace = gcmd.get_int('ACE', None)
+        requested_slot = gcmd.get_int('SLOT', None)
 
         self._last_unload_ok = True
 
@@ -7141,6 +8361,10 @@ class MultiAce:
                 '[multiACE] head %d is manual - ACE_UNLOAD_HEAD ignored, '
                 'unload it by hand' % head)
             return
+        selected_source = None
+        if calibration_prepare:
+            selected_source = self._calibration_prepare_unload_source(
+                gcmd, head, requested_ace, requested_slot)
         self._wait_bg_op(head, gcmd)
         if not self._head_is_loaded(head):
             self.log_always(self._t('msg.unload_head_already_empty',
@@ -7161,6 +8385,17 @@ class MultiAce:
                 logging.info('[multiACE] unload head %d: using bg-staged '
                              'ACE %d slot %d as the source'
                              % (head, staged[0], staged[1]))
+        recovery_source = False
+        if calibration_prepare:
+            if source is not None and (
+                    source.get('ace_index') != selected_source['ace_index']
+                    or source.get('slot') != selected_source['slot']):
+                raise gcmd.error(
+                    '[multiACE] selected calibration route does not match '
+                    'the tracked toolhead source')
+            if source is None:
+                source = selected_source
+                recovery_source = True
         if source:
             ace_index = source['ace_index']
             slot = source['slot']
@@ -7171,6 +8406,19 @@ class MultiAce:
                 if not self._switch_ace_for_head_target(ace_index):
                     raise gcmd.error(
                         '[multiACE] Failed to connect to ACE %d for unload!' % ace_index)
+            if recovery_source:
+                # FEED_AUTO resolves its retract slot through head_source.
+                # Record the user's validated route in memory so every
+                # downstream stage targets the selected spool rather than a
+                # first-ready or active-ACE fallback. A verified unload clears
+                # it normally; a failed/cancelled unload retains it for a safe
+                # retry during this Klipper session.
+                self._head_source[head] = dict(source)
+                self.log_always(
+                    '[multiACE] calibration preparation recovered unknown '
+                    'head %d source as ACE %d slot %d'
+                    % (self._disp(head), self._disp(ace_index),
+                       self._disp(slot)))
         else:
             logging.info(self._t('msg.unload_head_no_mapping', head=self._disp(head)))
 
@@ -7217,19 +8465,52 @@ class MultiAce:
 
         module, channel = self.EXTRUDER_MAP[head]
 
+        if calibration_prepare:
+            self._calibration_unload_begin(
+                head, active_idx, int(source.get('slot', head)))
+
         self._retract_length_override = retract_override if retract_override > 0 else None
+        cancelled = False
         try:
+            self._check_calibration_unload_cancel()
             self.gcode.run_script_from_command(
                 "FEED_AUTO MODULE=%s CHANNEL=%d EXTRUDER=%d UNLOAD=1 STAGE=prepare"
                 % (module, channel, head))
+            self._check_calibration_unload_cancel()
             self.gcode.run_script_from_command(
                 "FEED_AUTO MODULE=%s CHANNEL=%d EXTRUDER=%d UNLOAD=1 STAGE=doing"
                 % (module, channel, head))
+            self._check_calibration_unload_cancel()
         except Exception as e:
             self._audit_state('UNLOAD_HEAD_FAILED', {'head': head, 'reason': 'feed_auto_error', 'error': str(e), 'active_device': self._active_device_index})
-            raise
+            cancelled = bool(
+                calibration_prepare
+                and self._calibration_unload.get('cancel_requested'))
+            if not cancelled:
+                if calibration_prepare:
+                    self._calibration_unload_finish()
+                raise
         finally:
             self._retract_length_override = None
+
+        if cancelled:
+            self._last_unload_ok = False
+            try:
+                self.gcode.run_script_from_command('M104 S0')
+                self.gcode.run_script_from_command(
+                    'SET_FILAMENT_SENSOR SENSOR=e%d_filament ENABLE=1' % head)
+            except Exception:
+                pass
+            self._calibration_unload_finish()
+            self.log_always(
+                '[multiACE] Calibration preparation unload cancelled for '
+                'head %d; verify filament position before retrying'
+                % self._disp(head))
+            self._audit_state('CALIBRATION_UNLOAD_CANCELLED', {'head': head})
+            return
+
+        if calibration_prepare:
+            self._calibration_unload_finish()
 
         if keep_heat > 0:
             self.gcode.run_script_from_command('M104 S%d' % keep_heat)
@@ -9624,6 +10905,8 @@ class MultiAce:
             'head_ace': {str(h): int(self.head_ace.get(h, h))
                          for h in range(4)},
             'swap_in_progress': self._swap_in_progress,
+            'calibration': dict(self._calibration),
+            'calibration_unload': dict(self._calibration_unload),
             'aces': aces,
         }
 
