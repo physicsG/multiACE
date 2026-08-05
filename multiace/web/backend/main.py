@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import configparser
 import json
 import logging
 import os
@@ -45,6 +46,10 @@ from pydantic import BaseModel
 import preflight_core
 
 MOONRAKER_URL = os.environ.get("MOONRAKER_URL", "http://127.0.0.1:7125")
+EXTENDED2_CFG = os.environ.get(
+    "EXTENDED2_CFG",
+    "/home/lava/printer_data/config/extended/extended2.cfg",
+)
 MULTIACE_CFG_PATH = os.environ.get(
     "MULTIACE_CFG_PATH",
     "/home/lava/printer_data/config/extended/ace.cfg",
@@ -593,6 +598,7 @@ class SlotOverride(BaseModel):
     brand: str | None = ""
     subtype: str | None = ""
     color: str | None = ""
+    spool_id: int | None = None
 
 async def _mr_get(path: str) -> dict:
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -609,6 +615,35 @@ async def _mr_post(path: str, body: dict | None = None, timeout: float = 30.0) -
 @app.get("/api/health")
 async def health() -> dict:
     return {"status": "ok", "version": VERSION, "ts": time.time()}
+
+@app.get("/api/spoolman")
+async def spoolman_spools() -> dict:
+    """Return Spoolman connection status and full spool list.
+    Reads the server URL from the U1 extended firmware config
+    (extended2.cfg [spoolman] host) and calls Spoolman directly,
+    so Moonraker's own spoolman integration does not need to be active."""
+    url: str | None = None
+    try:
+        p = configparser.ConfigParser(interpolation=None)
+        p.read(EXTENDED2_CFG)
+        raw = p.get("spoolman", "host", fallback=None)
+        if raw:
+            url = raw.strip().rstrip("/")
+    except Exception:
+        pass
+    if not url:
+        return {"active": False, "spools": [], "url": None}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{url}/api/v1/spool",
+                                 params={"limit": 2000, "allow_archived": "false"})
+            r.raise_for_status()
+            spools = r.json()
+    except Exception:
+        return {"active": False, "spools": [], "url": url}
+    if not isinstance(spools, list):
+        spools = []
+    return {"active": True, "spools": spools, "url": url}
 
 @app.get("/api/version")
 async def version() -> dict:
@@ -2105,6 +2140,8 @@ async def set_slot_override(req: SlotOverride) -> dict:
         "subtype":  req.subtype or "",
         "color":    req.color or "",
     }
+    if req.spool_id is not None:
+        new["spool_id"] = req.spool_id
     old = _slot_overrides.get(key)
     _slot_overrides[key] = new
     _trace.info("override SET via picker POST ACE %d / slot %d: %s -> %s",

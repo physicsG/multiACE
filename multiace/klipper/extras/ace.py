@@ -448,6 +448,7 @@ class MultiAce:
 
         self._v2_active_rev_assist = False
         self._test_cancel = False
+        self._unload_all_cancel = False
         self._auto_feed_enabled = False
         self._fa_context = 'idle'
 
@@ -657,6 +658,9 @@ class MultiAce:
         self.gcode.register_command(
             'ACE_UNLOAD_ALL_HEADS', self.cmd_ACE_UNLOAD_ALL_HEADS,
             desc=self.cmd_ACE_UNLOAD_ALL_HEADS_help)
+        self.gcode.register_command(
+            'ACE_UNLOAD_ALL_CANCEL', self.cmd_ACE_UNLOAD_ALL_CANCEL,
+            desc='[multiACE] Cancel a running ACE_UNLOAD_ALL_HEADS after the current toolhead')
         self.gcode.register_command(
             'ACE_TEST', self.cmd_ACE_TEST,
             desc=self.cmd_ACE_TEST_help)
@@ -8723,6 +8727,7 @@ class MultiAce:
 
     cmd_ACE_UNLOAD_ALL_HEADS_help = '[multiACE] Unload all toolheads that have filament loaded'
     def cmd_ACE_UNLOAD_ALL_HEADS(self, gcmd):
+        self._unload_all_cancel = False
 
         if self._feed_assist_index != -1:
             self._disable_feed_assist()
@@ -8730,6 +8735,10 @@ class MultiAce:
 
         unloaded_any = False
         for head in range(4):
+            if self._unload_all_cancel:
+                self.log_always('[multiACE] ACE_UNLOAD_ALL_HEADS cancelled by user')
+                self._unload_all_cancel = False
+                break
             if self.head_is_manual(head):
                 continue
             sensor = self.printer.lookup_object(
@@ -8822,6 +8831,10 @@ class MultiAce:
     def cmd_ACE_TEST_CANCEL(self, gcmd):
         self._test_cancel = True
         self.log_always(self._t('msg.test_cancel_requested'))
+
+    def cmd_ACE_UNLOAD_ALL_CANCEL(self, gcmd):
+        self._unload_all_cancel = True
+        self.log_always('[multiACE] Cancel requested - will stop after current toolhead')
 
     cmd_ACE_DRY_help = '[multiACE] Start drying on ACE. Usage: ACE_DRY ACE=0 [TEMP=] [DURATION=]'
     def cmd_ACE_DRY(self, gcmd):
