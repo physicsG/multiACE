@@ -58,6 +58,7 @@ nav button.active { background: var(--accent); color: var(--accent-fg); border-c
 .conn.ok { color: var(--ok); }
 .conn.warn { color: var(--warn); }
 .conn.err { color: var(--error); }
+.spoolman-logo { width: 1.1em; height: 1.1em; vertical-align: middle; border-radius: 3px; }
 main { padding: 1rem; max-width: 1200px; margin: 0 auto; }
 section { animation: fade .15s ease-out; }
 @keyframes fade { from {opacity: 0;} to {opacity: 1;} }

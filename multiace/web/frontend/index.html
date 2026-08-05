@@ -41,7 +41,7 @@
           :class="!spoolman.checked ? '' : spoolman.active ? 'ok' : spoolman.url ? 'warn' : ''"
           :title="spoolman.active ? 'Spoolman connected: ' + spoolman.url
                   : spoolman.url ? 'Spoolman unreachable: ' + spoolman.url
-                  : 'Spoolman not configured'">🧵{{ spoolman.active ? ' ✓' : '' }}</span>
+                  : 'Spoolman not configured'"><img src="spoolman.svg" class="spoolman-logo" alt="Spoolman">{{ spoolman.active ? ' ✓' : '' }}</span>
   </header>
   <div v-if="rebootNeeded" class="reboot-banner">{{ t('ui.common.please_restart') }}</div>
   <main>
@@ -727,7 +727,7 @@ reboot</pre>
       <div class="row">
         <button @click="closePicker">{{ t('ui.common.cancel') }}</button>
         <button v-if="spoolman.active && (picker.head === null || picker.head === undefined)"
-                @click="openSpoolPickerFromPicker()">🧵 Spoolman</button>
+                @click="openSpoolPickerFromPicker()"><img src="spoolman.svg" class="spoolman-logo" alt=""> Spoolman</button>
         <button @click="savePicker(false)" class="primary">{{ t('ui.dialog.picker_save') }}</button>
         <button v-if="picker.head === null || picker.head === undefined"
                 @click="savePicker(true)" :disabled="isToolheadOccupied(picker.ace, picker.slot)">{{ t('ui.dialog.picker_load_after') }}</button>
