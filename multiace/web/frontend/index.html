@@ -39,7 +39,8 @@
     <span class="conn" :class="connClass">{{ connText }}</span>
     <span class="conn spoolman-chip"
           :class="!spoolman.checked ? '' : spoolman.active ? 'ok' : spoolman.url ? 'warn' : ''"
-          :title="spoolman.active ? 'Spoolman connected: ' + spoolman.url
+          :title="!spoolman.checked ? 'Checking Spoolman status...'
+                  : spoolman.active ? 'Spoolman connected: ' + spoolman.url
                   : spoolman.url ? 'Spoolman unreachable: ' + spoolman.url
                   : 'Spoolman not configured'"><img src="spoolman.svg" class="spoolman-logo" alt="Spoolman">{{ spoolman.active ? ' ✓' : '' }}</span>
   </header>
@@ -678,7 +679,7 @@ reboot</pre>
         </button>
       </div>
       <div class="row" style="margin-top:.8rem">
-        <button @click="closeSpoolPicker">Cancel</button>
+        <button @click="closeSpoolPicker">{{ t('ui.common.cancel') }}</button>
         <button v-if="spoolPickerSlotHasOverride" class="warn" @click="clearSpoolPickerOverride"
                 title="Remove the current spool override from this slot">✕ Clear spool</button>
       </div>

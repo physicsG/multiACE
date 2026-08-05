@@ -624,7 +624,7 @@ async def spoolman_spools() -> dict:
     so Moonraker's own spoolman integration does not need to be active."""
     url: str | None = None
     try:
-        p = configparser.ConfigParser()
+        p = configparser.ConfigParser(interpolation=None)
         p.read(EXTENDED2_CFG)
         raw = p.get("spoolman", "host", fallback=None)
         if raw:

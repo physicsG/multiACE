@@ -1202,7 +1202,8 @@ createApp({
       reloadState();
     }
     // ---- Spoolman spool picker -------------------------------------------
-    // Loads spools from Moonraker's Spoolman proxy (/api/spoolman).
+    // Loads spools from the multiACE backend (/api/spoolman), which
+    // reads the configured Spoolman URL and calls Spoolman directly.
     // Opens a searchable modal per slot; selecting a spool posts a slot
     // override with the spool's material/brand/color + stores spool_id.
     const spoolman = reactive({ active: false, spools: [], loading: false, url: null, checked: false });
@@ -1241,7 +1242,7 @@ createApp({
       if (!f) return list;
       return list.filter(sp => {
         const fil = sp.filament || {};
-        const vendor = ((fil.vendor && fil.vendor.name) || fil.vendor || "").toLowerCase();
+        const vendor = ((fil.vendor && fil.vendor.name) || (typeof fil.vendor === "string" ? fil.vendor : "") || "").toLowerCase();
         const mat = (fil.material || "").toLowerCase();
         const name = (fil.name || "").toLowerCase();
         return mat.includes(f) || vendor.includes(f) || name.includes(f);
@@ -1296,10 +1297,10 @@ createApp({
       const aceIdx = spoolPicker.ace;
       const slotIdx = spoolPicker.slot;
       const fil = spool.filament || {};
-      const colorRaw = (fil.color_hex || "ffffff").replace(/^#/, "");
-      const color = "#" + colorRaw.toLowerCase().padEnd(6, "0").slice(0, 6);
+      const colorRaw = typeof fil.color_hex === "string" ? fil.color_hex.replace(/^#/, "").trim() : "";
+      const color = /^[0-9a-fA-F]{6}$/.test(colorRaw) ? ("#" + colorRaw.toLowerCase()) : "";
       const brand = ((fil.vendor && fil.vendor.name) || (typeof fil.vendor === "string" ? fil.vendor : "") || "").trim();
-      const material = (fil.material || "PLA").trim();
+      const material = (fil.material || "").trim();
       // Use filament name as subtype when set; it carries "Matte", "Silk", etc.
       const subtype = (fil.name || "").trim();
       try {
@@ -1324,15 +1325,9 @@ createApp({
       const h = ((spool.filament || {}).color_hex || "").replace(/^#/, "");
       return h.length >= 6 ? "#" + h.slice(0, 6) : "#888888";
     }
-    function _spoolColorLum(hex) {
-      const r = parseInt(hex.slice(1, 3), 16);
-      const g = parseInt(hex.slice(3, 5), 16);
-      const b = parseInt(hex.slice(5, 7), 16);
-      return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-    }
     function spoolCardStyle(spool) {
       const hex = _spoolColorHex(spool);
-      return { "--spool-color": hex, "--spool-fg": _spoolColorLum(hex) > 0.55 ? "#001619" : "#fff" };
+      return { "--spool-color": hex };
     }
     function spoolLabel(spool) {
       const fil = spool.filament || {};
