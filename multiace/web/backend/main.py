@@ -636,7 +636,7 @@ async def spoolman_spools() -> dict:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{url}/api/v1/spool",
-                                 params={"limit": 2000, "allow_archived": False})
+                                 params={"limit": 2000, "allow_archived": "false"})
             r.raise_for_status()
             spools = r.json()
     except Exception:

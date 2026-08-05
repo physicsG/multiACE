@@ -1217,7 +1217,7 @@ createApp({
         if (!r.ok) return; // server error — keep last known state
         const j = await r.json();
         spoolman.url = j.url || null;
-        if (j.url === null || j.url === undefined) {
+        if (!j.url) {
           // Spoolman not configured in extended2.cfg → hide buttons
           spoolman.active = false;
           spoolman.spools = [];
