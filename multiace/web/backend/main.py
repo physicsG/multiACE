@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import configparser
 import json
 import logging
 import os
@@ -621,7 +622,6 @@ async def spoolman_spools() -> dict:
     Reads the server URL from the U1 extended firmware config
     (extended2.cfg [spoolman] host) and calls Spoolman directly,
     so Moonraker's own spoolman integration does not need to be active."""
-    import configparser
     url: str | None = None
     try:
         p = configparser.ConfigParser()
