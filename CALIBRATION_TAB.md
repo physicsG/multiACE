@@ -4,6 +4,7 @@ Status: Calibration and verification implementation present in the working tree
 Target UI: `multiace/web/frontend`
 Target firmware: `multiace/klipper/extras/ace.py`
 Mockup: [`multiace/web/mockups/calibration-tab.html`](multiace/web/mockups/calibration-tab.html)
+Guided sub-tab UX mockup: [`multiace/web/mockups/calibration-guided-tabs.html`](multiace/web/mockups/calibration-guided-tabs.html)
 Engineering reference: [`FILAMENT_MOTION_FEATURE_REFERENCE.md`](FILAMENT_MOTION_FEATURE_REFERENCE.md)
 
 ## Current implementation
