@@ -154,6 +154,8 @@
           <span>{{ t('ui.dashboard.toolheads') }}</span>
           <button class="unload-all-btn" @click="unloadAll()"
                   :disabled="isPrinting" :title="isPrinting ? t('ui.dashboard.blocked_printing') : ''">{{ t('ui.dashboard.unload_all') }}</button>
+          <button v-if="anyUnloading" class="cancel-unload-btn" @click="cancelUnloadAll()"
+                  title="Cancel after current toolhead">✕</button>
         </h3>
         <div class="toolhead-grid">
           <article v-for="t_ in state.toolheads" :key="t_.idx"

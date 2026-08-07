@@ -570,6 +570,12 @@ createApp({
       if (_blockIfPrinting()) return;
       run("ACE_UNLOAD_ALL_HEADS");
     }
+    function cancelUnloadAll() {
+      run("ACE_UNLOAD_ALL_CANCEL");
+    }
+    const anyUnloading = computed(() =>
+      Object.values(toolheadOps.value).some(op => op === 'unloading')
+    );
     async function setHeadManual(idx, enable) {
       try {
         await fetch(`${API}/head-manual`, {
@@ -2902,7 +2908,7 @@ createApp({
       sourceLabel,
       tab, version, printerName, printerFw, connClass, connText, screenAvailable,
       state, loadError, run, macroLog,
-      slotTitle, switchAce, loadSlot, loadFeederHead, slotLoadedInHead, loadAll, unloadHead, unloadAll, setHeadManual, setHeadFeeder, setHeadAce, aceOptionsForHead, headAceOf, visibleAces, openHeadPicker, isToolheadOccupied, needsReload, toolheadOps, bgEnabledFor, setBgHead, setPickupCleaning,
+      slotTitle, switchAce, loadSlot, loadFeederHead, slotLoadedInHead, loadAll, unloadHead, unloadAll, cancelUnloadAll, anyUnloading, setHeadManual, setHeadFeeder, setHeadAce, aceOptionsForHead, headAceOf, visibleAces, openHeadPicker, isToolheadOccupied, needsReload, toolheadOps, bgEnabledFor, setBgHead, setPickupCleaning,
       isPrinting,
       dryerCfg, dryStart, dryStop, dryOpenAce, toggleDryPanel, aceDrying,
       snapshots, selectedSnapshot, snapshotPreview, saveSnapshot, loadSnapshot, deleteSnapshot,

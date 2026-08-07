@@ -222,6 +222,12 @@ header h1 .hl { color: var(--accent); }
   text-transform: none; letter-spacing: 0; font-weight: 500;
 }
 .th-section-head .unload-all-btn:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
+.th-section-head .cancel-unload-btn {
+  background: var(--danger); color: #fff; border: 1px solid var(--danger);
+  padding: .35rem .7rem; border-radius: 4px; cursor: pointer; font-size: .85rem;
+  font-weight: 700; margin-left: .3rem;
+}
+.th-section-head .cancel-unload-btn:hover { opacity: .8; }
 .slot-row { display: flex; gap: .3rem; margin: .5rem 0; }
 .slot-cell { flex: 1; display: flex; flex-direction: column; gap: .25rem; }
 .slot-cell .slot { width: 100%; }
