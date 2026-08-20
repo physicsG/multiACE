@@ -6,33 +6,34 @@ Started as a SnapACE fork, it has grown to over 5 times the original size, with 
 
 [![Guides & Downloads](visitbutton.png)](https://postapocalyptic-diy.com/multiace/)
 
-**Since the very first version I have been asked about this "occasionally", so I finally sat down and built it: ACE per head mode and background swaps.**
+(manuals will be updated soon)
 
 
+## What's new in multiACE 0.99.8b "Resupply Run" (Update, mod and firmware.bin available)
+- Quad Replenish - ACE Refill - When a spool runs out mid-print, multiACE loads a matching spool from another ace or slot and continues.
+- Spool management - A list of your spools with material, colour, vendor and remaining weight, linked to the slots. Consumption is booked while printing, so the remaining weight stays current on its own. Spools can be assigned by hand or automatically from an RFID tag. Synced with an external stock system. (Spoolman or SpoolLink (paxx) the inventory degrades to a cache.
+ACE units do not read or expose the spools uid so it uses the sku field. (Spoolman: sku = id or cards_uid)
+- Humidity-controlled drying - An ACE 2 regulates its dryer by its own humidity reading instead of a fixed timer, and takes any connected ACE Pro along, which cannot measure humidity itself.
+- Per-pair purge - The flush volume for a colour change is now taken from the slicer's own flush matrix instead of one fixed length for every pair. Similar colours purge less, hard transitions purge more.
+- Air Print Detection - Watches the flow sensor during loading and while printing and catches cases where filament is present but nothing actually comes out of the nozzle.
+- Updated Compact panel view - Renders a reduced view that can be embedded in Fluidd as a cam, so the ACE status stays visible next to the print.
+- Firmware flash: ACE 2 firmware updates from the web UI. Duration now 10sec instead of 30minutes.
 
+(The flash engine is based on hakimio's OTA updater and is used with his permission. Thanks to hakimio for doing the reverse engineering that made this possible in the first place, and for letting multiACE build on it.
 
-## What's new in multiACE 0.99.6.1b "Persistent Pesterers" Hotfix 1
-
-**Fixes**
-
-Prime Tower regression in multiMode Ace swaps fixed
-
+  
 **Nozzle wiper updated to version 2 — new, larger purge bin.**
 
 **https://makerworld.com/en/models/3084827** Wiper
 **https://makerworld.com/en/models/3040955** Bin & Bin XL
 
-
 - Custom Temp and Tip Forming (see https://postapocalyptic-diy.com/temp-and-tip-tuning/)
   Easily exchangeable through strings, Step Editor included in config, Please post you results in the sticky issue
-  **Thanks to forum user Popstar (forum.snapmaker.com), the default PLA swap temperature is now 220 °C. Together with a short extra   push on load ("seat press"), swap reliability on my system has improved. Whether that's also true for other systems remains     to be seen.**
 - **Parked position background swaps** (per Head mode only, it is not possible in multi mode with Ace Hardware)
   (Even though this mode is now part of the release, it is still considered **experimental**. Even with the new hardware, contamination    from the park position can end up in the print. Purge may build up on the wipers.)
   I'll try to work that out. Everyone is invited to share their ideas in the meantime.
 - Parallel preload
-- Pickup-Cleaning (a short nozzle wipe after same‑colour tool pickups that have no cleaning move.) Preflight only atm.
-- Ace per Head mode up to 4 Aces / 7 Colors with U1 + just 1 ACE Pro, 10 with 2, 13 with 3 and 16 with 4
-- Prepared for the 1.5.1 Firmware
+- Prepared for the 1.5.2 Firmware
 - Many internal improvements
 
 
@@ -255,7 +256,7 @@ Before installing multiACE, ensure the following:
    ssh root@<printer-ip>
    ```
 
-### Quick Install (Recommended)
+### Install
 
 1. Download or clone this repository
 2. Copy the `multiace/` folder to your printer via SCP/SFTP (e.g. WinSCP on Windows, or command line):
@@ -273,7 +274,6 @@ Before installing multiACE, ensure the following:
    ```
 5. Reboot the printer
 6. multiACE starts in **Multi mode** - all connected ACE units are detected automatically
-
 
 
 ### Uninstall
@@ -601,10 +601,12 @@ All content is reviewed by humans before inclusion.
 
 - **Popstar (forum.snapmaker.com)**
   - **the default PLA swap temperature is set to 220 °C**
-
+ 
+    
+ 
 ## Credits
 
-- **[ Hakimio](https://github.com/hakimio)** for ACE Pro 2 reverse engineering and support
+- **[ Hakimio](https://github.com/hakimio)** for ACE Pro 2 reverse engineering and support, firmware flash
 - **[SnapACE](https://github.com/BlackFrogKok/SnapACE)** by BlackFrogKok - Foundation for ACE Pro Klipper integration
 - **[DuckACE](https://github.com/utkabobr/DuckACE)** - ACE Pro reverse engineering and protocol documentation
 - **[ACE Research](https://github.com/printers-for-people/ACEResearch)** by Printers for People - ACE Pro protocol research
