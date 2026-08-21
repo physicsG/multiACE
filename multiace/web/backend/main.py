@@ -619,6 +619,7 @@ def _parse_state(status: dict) -> dict:
     language = sv_vars.get("ace__language", os.environ.get("MULTIACE_LANGUAGE", "en"))
     idx_base = _read_display_index_base()
     return {
+        'calibration':        ace.get('calibration') or {'state': 'idle'},
         "ace_status":         ace.get("status"),
         "ace_temp":           ace.get("temp"),
         "printer_state":      printer_state,
@@ -751,6 +752,21 @@ class TipformUpdate(BaseModel):
     mode: str
     tables: dict[str, str]
     restart_klipper: bool = False
+
+class CalibrationStart(BaseModel):
+    ace: int
+    slot: int
+    head: int
+    scope: str = 'ace'
+
+class CalibrationAction(BaseModel):
+    action: str
+    length: int | None = None
+    session_id: int | None = None
+    ace: int | None = None
+    slot: int | None = None
+    head: int | None = None
+    scope: str | None = None
 
 class SnapshotSave(BaseModel):
     name: str
@@ -2714,6 +2730,118 @@ async def run_macro(req: MacroRequest) -> dict:
         raise HTTPException(status_code=502,
             detail='moonraker: %s' % (str(e) or type(e).__name__))
     return {"script": script, "result": result}
+
+def _raw_calibration(status: dict) -> dict:
+    ace = status.get('ace', {}) or {}
+    return ace.get('calibration') or {'state': 'idle', 'session_id': 0}
+
+async def _dispatch_calibration(script: str) -> dict:
+    try:
+        return await _mr_post('/printer/gcode/script', {'script': script},
+                              timeout=30.0)
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text if e.response is not None else str(e)
+        raise HTTPException(
+            status_code=e.response.status_code if e.response is not None else 502,
+            detail=detail)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail='moonraker: %s' % e)
+
+@app.get('/api/calibration')
+async def get_calibration() -> dict:
+    try:
+        status = await _query_state_gated()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail='moonraker: %s' % e)
+    return _raw_calibration(status)
+
+@app.post('/api/calibration/start')
+async def start_calibration(payload: CalibrationStart) -> dict:
+    if not (0 <= payload.ace <= 3 and 0 <= payload.slot <= 3
+            and 0 <= payload.head <= 3):
+        raise HTTPException(400, 'ace, slot and head must be 0-3')
+    scope = (payload.scope or 'ace').strip().lower()
+    if scope not in ('ace', 'slot'):
+        raise HTTPException(400, 'scope must be ace or slot')
+    script = ('ACE_CALIBRATION_START ACE=%d SLOT=%d HEAD=%d SCOPE=%s'
+              % (payload.ace, payload.slot, payload.head, scope))
+    result = await _dispatch_calibration(script)
+    return {'ok': True, 'script': script, 'result': result}
+
+@app.post('/api/calibration/action')
+async def calibration_action(payload: CalibrationAction) -> dict:
+    action = (payload.action or '').strip().lower()
+    try:
+        status = await _query_state_gated()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail='moonraker: %s' % e)
+    current = _raw_calibration(status)
+    if (payload.session_id is not None
+            and int(current.get('session_id', 0)) != payload.session_id):
+        raise HTTPException(409, 'calibration session changed; reload state')
+    if action == 'feed':
+        script = 'ACE_CALIBRATION_FEED'
+    elif action == 'retract':
+        length = int(payload.length or 0)
+        if length < 5 or length > 500:
+            raise HTTPException(400, 'retract length must be 5-500 mm')
+        script = 'ACE_CALIBRATION_RETRACT LENGTH=%d' % length
+    elif action == 'mark_swap':
+        script = 'ACE_CALIBRATION_MARK MARK=swap'
+    elif action == 'return_park':
+        script = 'ACE_CALIBRATION_RETURN'
+    elif action == 'verify_start':
+        script = 'ACE_CALIBRATION_VERIFY ACTION=start'
+        route = (payload.ace, payload.slot, payload.head)
+        if any(value is not None for value in route):
+            if not all(value is not None for value in route):
+                raise HTTPException(400, 'verify route requires ace, slot and head')
+            if not all(0 <= int(value) <= 3 for value in route):
+                raise HTTPException(400, 'ace, slot and head must be 0-3')
+            scope = (payload.scope or 'ace').strip().lower()
+            if scope not in ('ace', 'slot'):
+                raise HTTPException(400, 'scope must be ace or slot')
+            script += ' ACE=%d SLOT=%d HEAD=%d SCOPE=%s' % (
+                payload.ace, payload.slot, payload.head, scope)
+    elif action == 'verify_continue':
+        script = 'ACE_CALIBRATION_VERIFY ACTION=continue'
+    elif action == 'verify_pause':
+        script = 'ACE_CALIBRATION_VERIFY ACTION=pause'
+    elif action == 'verify_resume':
+        script = 'ACE_CALIBRATION_VERIFY ACTION=resume'
+    elif action == 'verify_jog':
+        length = int(payload.length or 0)
+        if abs(length) not in (1, 2, 5, 10):
+            raise HTTPException(
+                400, 'verification jog must be +/-1, 2, 5, or 10 mm')
+        script = 'ACE_CALIBRATION_VERIFY ACTION=jog LENGTH=%d' % length
+    elif action == 'cancel':
+        script = 'ACE_CALIBRATION_CANCEL'
+    elif action == 'reset':
+        script = 'ACE_CALIBRATION_RESET'
+    else:
+        raise HTTPException(400, 'unknown calibration action')
+    result = await _dispatch_calibration(script)
+    return {'ok': True, 'script': script, 'result': result}
+
+@app.post('/api/calibration/unload-cancel')
+async def cancel_calibration_unload() -> dict:
+    """Cancel preparation out-of-band through a Klipper webhook.
+
+    This deliberately does not dispatch G-code: a cancellation submitted to
+    the G-code queue cannot run until the blocking unload has already ended.
+    """
+    try:
+        result = await _mr_post(
+            '/printer/multiace/calibration_unload_cancel', {}, timeout=5.0)
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text if e.response is not None else str(e)
+        raise HTTPException(
+            status_code=e.response.status_code if e.response is not None else 502,
+            detail=detail)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail='moonraker: %s' % e)
+    return {'ok': True, 'result': result}
 
 def _extract_params(text: str) -> tuple[dict[str, str], dict[int, dict[str, str]]]:
     """Pull `key: value` pairs out of [ace] and per-ACE [ace N] sections.

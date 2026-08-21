@@ -252,6 +252,8 @@
     <nav>
       <button v-if="state.mode !== 'normal'"
               :class="{active: tab==='dashboard'}" @click="tab='dashboard'">{{ t('ui.tabs.dashboard') }}</button>
+      <button v-if="state.mode !== 'normal'"
+              :class="{active: tab==='calibration'}" @click="tab='calibration'">{{ t('ui.tabs.calibration') }}</button>
       <button :class="{active: tab==='spools'}" @click="tab='spools'">{{ t('ui.tabs.spools') }}</button>
       <button :class="{active: tab==='config'}" @click="tab='config'">{{ t('ui.tabs.config') }}</button>
       <button v-for="p in plugins.items" :key="p.name"
@@ -479,6 +481,8 @@
           <span>{{ t('ui.dashboard.toolheads') }}</span>
           <button class="unload-all-btn" @click="unloadAll()"
                   :disabled="isPrinting" :title="isPrinting ? t('ui.dashboard.blocked_printing') : ''">{{ t('ui.dashboard.unload_all') }}</button>
+          <button v-if="anyUnloading" class="cancel-unload-btn" @click="cancelUnloadAll()"
+                  title="Cancel after current toolhead">✕</button>
         </h3>
         <div class="toolhead-grid">
           <article v-for="t_ in state.toolheads" :key="t_.idx"
@@ -625,6 +629,588 @@
       <transition name="macrolog-fade">
         <pre v-if="macroLog" class="macro-log">{{ macroLog }}</pre>
       </transition>
+    </section>
+    <section v-show='tab === `calibration`' class='calibration-page'>
+      <p v-if='calibrationUi.error' class='error'>{{ calibrationUi.error }}</p>
+      <div class='calibration-heading'>
+        <div>
+          <h2>Filament path</h2>
+          <p class='muted'>Set up, calibrate, and verify one ACE route at a time.</p>
+        </div>
+        <span class='pill'>Session <strong>{{ state.calibration.state || 'idle' }}</strong></span>
+      </div>
+
+      <div v-if='!connectedCalibrationAces.length' class='error'>No connected ACE units are available.</div>
+      <div v-else class='calibration-guided'>
+        <div class='calibration-workspace'>
+          <div class='calibration-route-summary'>
+            <div>
+              <strong>ACE {{ dispIdx(calibrationUi.ace) }} · Slot {{ dispIdx(calibrationUi.slot) }}
+                → Toolhead T{{ dispIdx(calibrationUi.head) }}</strong>
+              <small>{{ calibrationTipLabel }}</small>
+            </div>
+            <span :class='{ready: calibrationRouteKnown}'>
+              {{ calibrationMoving ? 'Moving'
+                : state.calibration.state === `verify_paused` ? 'Paused'
+                  : calibrationRouteKnown ? 'Route known' : 'Needs calibration' }}
+            </span>
+          </div>
+          <div class='calibration-route'
+               :class='{moving: calibrationMoving,
+                        paused: state.calibration.state === `verify_paused`,
+                        unknown: calibrationTipPositionMm == null}'
+               :title='calibrationTipLabel' :aria-label='calibrationTipLabel'>
+            <span><strong>ACE {{ dispIdx(calibrationUi.ace) }}</strong>Slot {{ dispIdx(calibrationUi.slot) }}</span>
+            <div class='calibration-route-tube'>
+              <b v-if='calibrationTipSegment === `ace`' class='calibration-tip-marker'
+                 :style='{"--tip": `${calibrationTipSegmentPercent}%`}'>
+                {{ calibrationTipPositionMm == null ? '?' : '●' }}
+              </b>
+            </div>
+            <span><strong>Splitter</strong>shared junction</span>
+            <div class='calibration-route-tube'>
+              <b v-if='calibrationTipSegment === `toolhead`' class='calibration-tip-marker'
+                 :style='{"--tip": `${calibrationTipSegmentPercent}%`}'>●</b>
+            </div>
+            <span><strong>Toolhead T{{ dispIdx(calibrationUi.head) }}</strong>
+              {{ calibrationSelectedHeadClear ? 'sensor clear'
+                : calibrationSelectedToolhead?.filament_at_extruder === true
+                  ? 'filament detected' : 'sensor unavailable' }}</span>
+          </div>
+          <div class='calibration-route-caption'>
+            <span v-if='calibrationRouteKnown'>
+              Splitter anchor <strong>{{ calibrationRouteAnchors.load - calibrationRouteAnchors.swap }} mm</strong>
+              · Toolhead <strong>{{ calibrationRouteAnchors.load }} mm</strong>
+            </span>
+            <span v-else>Route anchors are not calibrated yet.</span>
+            <span>{{ calibrationUi.scope === 'slot'
+              ? 'Slot ' + dispIdx(calibrationUi.slot) + ' override'
+              : 'Entire ACE defaults' }}</span>
+          </div>
+
+          <div class='calibration-workflow'>
+            <div class='calibration-workflow-tabs' role='tablist'
+                 aria-label='Calibration workflow'>
+              <button v-for='panel in [`setup`, `calibrate`, `verify`, `results`]'
+                      :key='panel' type='button' role='tab'
+                      :aria-selected='calibrationUi.panel === panel'
+                      :class='{active: calibrationUi.panel === panel}'
+                      @click='calibrationSetPanel(panel)'>
+                <strong>{{ panel[0].toUpperCase() + panel.slice(1) }}</strong>
+                <small>{{ calibrationTabStatus[panel] }}</small>
+              </button>
+            </div>
+            <div class='calibration-workflow-body'>
+              <section v-show='calibrationUi.panel === `setup`'
+                       class='calibration-panel'>
+                <div class='calibration-task-heading'>
+                  <div>
+                    <small>Setup</small>
+                    <h3>Choose one physical route</h3>
+                    <p>The selected ACE, Bowden path, and mapped toolhead stay visible throughout calibration and verification.</p>
+                  </div>
+                </div>
+
+                <div class='calibration-selector-block'>
+                  <label>ACE unit</label>
+                  <div class='calibration-option-grid two'>
+                    <button v-for='ace in connectedCalibrationAces' :key='ace.idx'
+                            type='button' class='calibration-route-option'
+                            :class='{selected: Number(calibrationUi.ace) === Number(ace.idx)}'
+                            :disabled='calibrationRouteLocked || !!calibrationUi.busy'
+                            @click='calibrationSelectAce(ace.idx)'>
+                      <strong>ACE {{ dispIdx(ace.idx) }}</strong>
+                      <small>{{ ace.protocol === 'v2'
+                        ? 'ACE 2 Pro · connected' : 'ACE Pro · connected' }}</small>
+                    </button>
+                  </div>
+                </div>
+
+                <div class='calibration-selector-block'>
+                  <label>Apply calibration to</label>
+                  <div class='calibration-option-grid two'>
+                    <button type='button' class='calibration-route-option'
+                            :class='{selected: calibrationUi.scope === `ace`}'
+                            :disabled='calibrationRouteLocked || !!calibrationUi.busy'
+                            @click='calibrationSetScope(`ace`)'>
+                      <strong>Entire ACE unit</strong>
+                      <small>Use shared defaults for every slot in this ACE.</small>
+                    </button>
+                    <button type='button' class='calibration-route-option'
+                            :class='{selected: calibrationUi.scope === `slot`}'
+                            :disabled='calibrationRouteLocked || !!calibrationUi.busy'
+                            @click='calibrationSetScope(`slot`)'>
+                      <strong>Single Bowden tube</strong>
+                      <small>Override only the selected slot path.</small>
+                    </button>
+                  </div>
+                </div>
+
+                <div class='calibration-selector-block'>
+                  <label>{{ calibrationUi.scope === 'ace'
+                    ? 'Measurement slot' : 'Bowden tube / filament slot' }}</label>
+                  <div class='calibration-option-grid slots'>
+                    <button v-for='slot in (calibrationSelectedAce?.slots || [])'
+                            :key='slot.idx' type='button'
+                            class='calibration-route-option'
+                            :class='{selected: Number(calibrationUi.slot) === Number(slot.idx)}'
+                            :disabled='calibrationRouteLocked || !!calibrationUi.busy
+                              || slot.state === `empty`'
+                            @click='calibrationSelectSlot(slot.idx)'>
+                      <strong>Slot {{ dispIdx(slot.idx) }}</strong>
+                      <small>{{ slot.state }}{{ Number(calibrationUi.slot) === Number(slot.idx)
+                        && calibrationRouteKnown ? ' · saved values' : '' }}</small>
+                    </button>
+                  </div>
+                </div>
+
+                <div class='calibration-derived-route'>
+                  <label class='calibration-head-select'>Connected toolhead
+                    <select v-model.number='calibrationUi.head'
+                            @change='calibrationSelectHead'
+                            :disabled='calibrationRouteLocked || !!calibrationUi.busy
+                              || state.mode === `multi`'>
+                      <option v-for='head in state.toolheads' :key='head.idx'
+                              :value='head.idx'>
+                        T{{ dispIdx(head.idx) }}{{ head.manual ? ' · manual'
+                          : head.feeder ? ' · feeder' : '' }}
+                      </option>
+                    </select>
+                  </label>
+                  <div>
+                    <small>{{ calibrationUi.scope === 'ace'
+                      ? 'Shared ACE values measured through' : 'Per-slot override' }}</small>
+                    <strong>ACE {{ dispIdx(calibrationUi.ace) }} · Slot
+                      {{ dispIdx(calibrationUi.slot) }} → T{{ dispIdx(calibrationUi.head) }}</strong>
+                  </div>
+                </div>
+
+                <p v-if='calibrationRouteLocked' class='calibration-warning'>
+                  Route locked to ACE {{ dispIdx(state.calibration.ace) }} · Slot
+                  {{ dispIdx(state.calibration.slot) }} while the tip is away from
+                  preload. Return or clear this route before selecting another spool.
+                </p>
+
+                <div class='calibration-checks'>
+                  <div :class='{ok: state.printer_state !== `printing`
+                    && state.printer_state !== `paused`}'>Printer is idle</div>
+                  <div :class='{ok: !state.swap_in_progress
+                    && !(state.bg_swap?.busy || []).length}'>No other route is moving</div>
+                  <div :class='{ok: calibrationSelectedHeadClear}'>
+                    T{{ dispIdx(calibrationUi.head) }} sensor
+                    {{ calibrationSelectedHeadClear ? 'is clear' : 'needs attention' }}
+                  </div>
+                  <div :class='{ok: calibrationSelectedSlot?.state === `ready`}'>
+                    Slot {{ dispIdx(calibrationUi.slot) }}
+                    {{ calibrationSelectedSlot?.state === 'ready'
+                      ? 'is parked at preload' : 'is not ready' }}
+                  </div>
+                </div>
+
+                <div class='calibration-confidence'
+                     :class='{estimate: calibrationSelectedAce?.protocol !== `v2`}'>
+                  <strong>{{ calibrationSelectedAce?.protocol === 'v2'
+                    ? 'Encoder observed' : 'Estimated distance' }}</strong>
+                  <span v-if='calibrationSelectedAce?.protocol === `v2`'>
+                    Decoder movement is diagnostic; configured millimetres use the bounded commanded distance.
+                  </span>
+                  <span v-else>ACE v1 has no decoder telemetry. Repeat and visually verify before applying.</span>
+                </div>
+
+                <div class='row calibration-primary-actions'>
+                  <button class='primary' @click='calibrationContinueRoute'>
+                    {{ calibrationRouteKnown
+                      ? 'Continue to verification' : 'Continue to calibration' }}
+                  </button>
+                </div>
+              </section>
+
+              <section v-show='calibrationUi.panel === `calibrate`'
+                       class='calibration-panel'>
+          <template v-if='[`idle`, `cancelled`, `failed`].includes(state.calibration.state)'>
+            <div v-if='calibrationRouteKnown && !calibrationUi.recalibrate'
+                 class='calibration-saved-summary'>
+              <div class='calibration-task-heading'>
+                <div>
+                  <small>Calibrate</small>
+                  <h3>This route already has measurements</h3>
+                  <p>Recalibration is optional. Verify the saved path first unless a tube, splitter, or toolhead route changed.</p>
+                </div>
+                <span>Saved values</span>
+              </div>
+              <div class='calibration-metrics'>
+                <div><small>Toolhead distance</small><strong>{{ calibrationRouteAnchors.load }} mm</strong></div>
+                <div><small>Splitter retract</small><strong>{{ calibrationRouteAnchors.swap }} mm</strong></div>
+                <div><small>Park return</small><strong>{{ calibrationRouteAnchors.load }} mm</strong></div>
+              </div>
+              <div class='row calibration-primary-actions'>
+                <button class='primary' @click='calibrationSetPanel(`verify`)'>
+                  Verify saved calibration
+                </button>
+                <button @click='calibrationBeginRecalibration'>Recalibrate this route</button>
+              </div>
+            </div>
+            <template v-else>
+            <h3>1 · Establish a clean slate</h3>
+            <p>Start from a known empty baseline. This prevents a previous load, stale route, or occupied toolhead from contaminating the measurement.</p>
+            <div class='calibration-checks'>
+              <div :class='{ok: state.printer_state !== `printing` && state.printer_state !== `paused`}'>Printer is idle</div>
+              <div :class='{ok: !state.swap_in_progress && !(state.bg_swap?.busy || []).length}'>No swap/background operation</div>
+              <div :class='{ok: calibrationSelectedHeadClear}'>
+                Selected T{{ dispIdx(calibrationUi.head) }}:
+                {{ calibrationSelectedHeadClear ? 'toolhead sensor is clear'
+                  : calibrationSelectedToolhead?.filament_at_extruder === true
+                    ? 'filament detected at toolhead sensor'
+                    : 'toolhead sensor state unavailable' }}
+              </div>
+              <div :class='{ok: calibrationUi.baselinePrepared}'>
+                {{ calibrationUi.baselinePrepared
+                  ? 'Clean starting point confirmed'
+                  : 'Clean starting point awaits confirmation' }}
+              </div>
+            </div>
+            <p v-if='state.calibration.error' class='error'>{{ state.calibration.error }}</p>
+            <div class='row'>
+              <button class='primary' :disabled='!calibrationCanPrepare || !!calibrationUi.busy || calibrationUi.baselinePrepared'
+                      @click='calibrationSelectedHeadClear
+                        ? calibrationConfirmBaseline() : calibrationPrepare()'>
+                {{ calibrationUi.busy === 'prepare' ? 'Unloading…'
+                  : calibrationUi.busy === 'confirm-baseline' ? 'Confirming…'
+                  : calibrationUi.baselinePrepared ? 'Clean starting point confirmed'
+                  : calibrationSelectedHeadClear
+                    ? `Use clear T${dispIdx(calibrationUi.head)} as starting point`
+                    : calibrationSelectedHeadSensorKnown
+                      ? `Unload selected T${dispIdx(calibrationUi.head)}`
+                      : 'Toolhead sensor unavailable' }}
+              </button>
+              <button v-if='calibrationUi.busy === `prepare`' class='warn'
+                      :disabled='calibrationUi.cancelRequested'
+                      @click='calibrationCancelPrepare'>
+                {{ calibrationUi.cancelRequested ? 'Stopping…' : 'Stop unload now' }}
+              </button>
+              <button v-if='calibrationRouteKnown && !calibrationUi.busy'
+                      @click='calibrationKeepSaved'>
+                Keep saved values
+              </button>
+            </div>
+
+            <div class='calibration-prep-next' :class='{locked: !calibrationUi.baselinePrepared}'>
+              <h3>2 · Prepare the selected route</h3>
+              <p>Remove and reinsert filament in the selected ACE inlet, then wait for automatic preload to finish. That fresh preload position becomes the parked reference for every measurement.</p>
+              <div class='calibration-checks'>
+                <div :class='{ok: calibrationSelectedAce?.connected}'>Selected ACE is connected</div>
+                <div :class='{ok: calibrationSelectedAce?.slots?.[calibrationUi.slot]?.state === `ready`}'>Selected slot is at its automatic preload reference</div>
+                <div :class='{ok: calibrationSelectedHeadClear}'>
+                  Selected T{{ dispIdx(calibrationUi.head) }} toolhead sensor is clear
+                </div>
+                <div :class='{ok: calibrationUi.routeConfirmed}'>Preload reference and physical route confirmed</div>
+              </div>
+              <div class='mode-row calibration-confirm-row'>
+                <button type='button' :class='{active: calibrationUi.routeConfirmed}'
+                        :disabled='!calibrationUi.baselinePrepared || calibrationMoving'
+                        @click='calibrationConfirmRoute'>
+                  {{ calibrationUi.routeConfirmed ? '✓ Preload reference confirmed' : 'Use ACE preload position and confirm route' }}
+                </button>
+              </div>
+              <p class='calibration-warning'>Calibration does not heat or extrude. Remove loose filament from the splitter/output tube and make sure only the selected slot enters this route.</p>
+              <div class='row'>
+                <button class='primary' :disabled='!calibrationCanStart || !!calibrationUi.busy'
+                      @click='calibrationStart'>
+                  {{ calibrationUi.busy ? 'Starting…' : 'Start and measure load' }}
+                </button>
+                <button v-if='state.calibration.state !== `idle`'
+                        @click='calibrationAction(`reset`)'>Reset session</button>
+              </div>
+            </div>
+            </template>
+          </template>
+
+          <template v-else-if='state.calibration.state === `prepared`'>
+            <h3>3 · Measure load</h3>
+            <p>Route prepared. Starting with a bounded 500 mm feed toward the toolhead sensor…</p>
+          </template>
+
+          <template v-else-if='state.calibration.state === `feeding`'>
+            <h3>3 · Measuring load distance</h3>
+            <p>The ACE starts with 500 mm, then continues in 100 mm increments while polling the toolhead sensor every 50 ms.</p>
+            <div class='calibration-metrics'>
+              <div><small>Commanded</small><strong>{{ state.calibration.commanded_feed_mm }} mm</strong></div>
+              <div><small>Decoder span</small><strong>{{ state.calibration.decoder_span ?? '—' }}</strong></div>
+              <div><small>Safety limit</small><strong>{{ state.calibration.max_feed_mm }} mm</strong></div>
+            </div>
+          </template>
+
+          <template v-else-if='[`at_sensor`, `retract_ready`, `retracting`, `swap_marked`, `returning`].includes(state.calibration.state)'>
+            <h3>{{ state.calibration.swap_retract_length_mm == null ? '4 · Clear the splitter' : '5 · Return to ACE preload reference' }}</h3>
+            <p v-if='state.calibration.swap_retract_length_mm == null'>Retract in steps until the filament tip has fully cleared the Y/4-way splitter, then mark it.</p>
+            <p v-else-if='state.calibration.state === `returning`'>Returning automatically to the measured automatic-preload position. No visual inspection inside the ACE is required.</p>
+            <p v-else>The splitter checkpoint is saved. Return the remaining measured distance to the ACE automatic-preload reference.</p>
+            <div class='calibration-metrics'>
+              <div><small>Load distance</small><strong>{{ state.calibration.load_length_mm }} mm</strong></div>
+              <div><small>Cumulative retract</small><strong>{{ state.calibration.commanded_retract_mm }} mm</strong></div>
+              <div><small>Swap checkpoint</small><strong>{{ state.calibration.swap_retract_length_mm ?? '—' }} mm</strong></div>
+            </div>
+            <div v-if='state.calibration.swap_retract_length_mm == null' class='calibration-jogs'>
+              <button v-for='mm in [5,10,25,50,100,250,500]' :key='mm'
+                      :disabled='calibrationMoving || !!calibrationUi.busy
+                        || Number(state.calibration.commanded_retract_mm || 0) + mm
+                          > Number(state.calibration.load_length_mm || 0)'
+                      @click='calibrationAction(`retract`, mm)'>−{{ mm }} mm</button>
+            </div>
+            <div class='row'>
+              <button v-if='state.calibration.state === `retract_ready`' class='primary'
+                      @click='calibrationAction(`mark_swap`)'>Mark splitter cleared</button>
+              <button v-if='state.calibration.state === `swap_marked`' class='primary'
+                      @click='calibrationAction(`return_park`)'>Return to preload reference</button>
+            </div>
+          </template>
+
+          <template v-else>
+            <p class='calibration-notice'>
+              <strong>{{ [`complete`, `verified`].includes(state.calibration.state)
+                ? 'Measurements are ready'
+                : 'Another workflow is active' }}</strong>
+              {{ [`complete`, `verified`].includes(state.calibration.state)
+                ? 'Review the current values in Results or verify the route again.'
+                : 'Use the active workflow tab to continue safely.' }}
+            </p>
+            <div class='row calibration-primary-actions'>
+              <button class='primary'
+                      @click='calibrationSetPanel(
+                        [`complete`, `verified`].includes(state.calibration.state)
+                          ? `results` : `verify`)'>
+                {{ [`complete`, `verified`].includes(state.calibration.state)
+                  ? 'Review results' : 'Continue active workflow' }}
+              </button>
+            </div>
+          </template>
+
+                <button v-if='[`feeding`, `retracting`, `returning`]
+                          .includes(state.calibration.state)'
+                        class='calibration-stop'
+                        @click='calibrationAction(`cancel`)'>
+                  Stop &amp; cancel
+                </button>
+              </section>
+
+              <section v-show='calibrationUi.panel === `verify`'
+                       class='calibration-panel'>
+                <div class='calibration-task-heading'>
+                  <div>
+                    <small>Verify</small>
+                    <h3>{{ calibrationVerifyMoving
+                      || [`verify_toolhead`, `verify_toolhead_adjust`,
+                          `verify_toolhead_adjusting`, `verify_splitter`,
+                          `verify_paused`].includes(state.calibration.state)
+                        ? 'Verification in progress' : 'Test the saved route' }}</h3>
+                    <p>Travel to the toolhead, stop at the splitter, then return to the ACE preload reference.</p>
+                  </div>
+                  <span v-if='calibrationRouteKnown'>Available</span>
+                </div>
+
+          <template v-if='[`verifying_feed`, `verify_toolhead`, `verify_toolhead_adjust`, `verify_toolhead_adjusting`, `verifying_splitter`, `verify_splitter`, `verifying_return`, `verify_paused`].includes(state.calibration.state)'>
+            <p v-if='state.calibration.state === `verifying_feed`'>Feeding from the ACE preload reference to the toolhead in one continuous move. The sensor is monitored throughout.</p>
+            <p v-else-if='state.calibration.state === `verify_toolhead`'>Stopped at the toolhead sensor. Inspect the endpoint, then continue manually.</p>
+            <p v-else-if='state.calibration.state === `verify_toolhead_adjust`'>The saved endpoint was reached but the toolhead sensor is still clear. Use the bounded controls below; movement stops automatically when the sensor trips.</p>
+            <p v-else-if='state.calibration.state === `verify_toolhead_adjusting`'>Fine-positioning the filament tip. The toolhead sensor is monitored throughout this bounded move.</p>
+            <p v-else-if='state.calibration.state === `verifying_splitter`'>Retracting from the toolhead to the measured splitter checkpoint in one continuous move.</p>
+            <p v-else-if='state.calibration.state === `verify_splitter`'>Stopped at the splitter checkpoint. Confirm the tip is clear of the junction, then continue manually.</p>
+            <p v-else-if='state.calibration.state === `verifying_return`'>Returning from the splitter to the ACE automatic-preload reference in one continuous move.</p>
+            <p v-else>Verification is paused. The marker is an estimate based on the completed portion of the commanded move.</p>
+            <div class='calibration-metrics'>
+              <div><small>Tip from ACE</small><strong>{{ Math.round(calibrationTipPositionMm ?? 0) }} mm</strong></div>
+              <div><small>Toolhead anchor</small><strong>{{ state.calibration.load_length_mm }} mm</strong></div>
+              <div><small>Splitter anchor</small><strong>{{ state.calibration.load_length_mm - state.calibration.swap_retract_length_mm }} mm</strong></div>
+            </div>
+            <p v-if='state.calibration.toolhead_sensor === true && state.calibration.verify_feed_delta_mm != null' class='muted'>Toolhead sensor triggered {{ state.calibration.verify_feed_delta_mm >= 0 ? '+' : '' }}{{ state.calibration.verify_feed_delta_mm }} mm from the calibrated load endpoint (timing estimate).</p>
+            <div v-if='[`verify_toolhead_adjust`, `verify_toolhead_adjusting`].includes(state.calibration.state)'
+                 class='calibration-fine-position'>
+              <div class='calibration-fine-head'>
+                <strong>Manual endpoint correction</strong>
+                <span>{{ Number(state.calibration.verify_fine_offset_mm || 0) >= 0 ? '+' : '' }}{{ state.calibration.verify_fine_offset_mm || 0 }} mm · limit ±{{ state.calibration.verify_fine_limit_mm || 50 }} mm</span>
+              </div>
+              <div class='calibration-fine-row'>
+                <span>Toward toolhead</span>
+                <div class='calibration-jogs'>
+                  <button v-for='mm in [1,2,5,10]' :key='`feed-${mm}`'
+                          :disabled='calibrationMoving || !!calibrationUi.busy
+                            || Number(state.calibration.verify_fine_offset_mm || 0) + mm
+                              > Number(state.calibration.verify_fine_limit_mm || 50)'
+                          @click='calibrationAction(`verify_jog`, mm)'>+{{ mm }} mm</button>
+                </div>
+              </div>
+              <div class='calibration-fine-row'>
+                <span>Toward ACE</span>
+                <div class='calibration-jogs'>
+                  <button v-for='mm in [1,2,5,10]' :key='`pull-${mm}`'
+                          :disabled='calibrationMoving || !!calibrationUi.busy
+                            || Number(state.calibration.verify_fine_offset_mm || 0) - mm
+                              < -Number(state.calibration.verify_fine_limit_mm || 50)'
+                          @click='calibrationAction(`verify_jog`, -mm)'>−{{ mm }} mm</button>
+                </div>
+              </div>
+            </div>
+            <div class='row'>
+              <button v-if='calibrationVerifyMoving' class='warn'
+                      :disabled='!!calibrationUi.busy'
+                      @click='calibrationAction(`verify_pause`)'>Pause verification</button>
+              <button v-if='state.calibration.state === `verify_paused`' class='primary'
+                      :disabled='!!calibrationUi.busy'
+                      @click='calibrationAction(`verify_resume`)'>Resume verification</button>
+              <button v-if='state.calibration.state === `verify_toolhead`' class='primary'
+                      :disabled='!!calibrationUi.busy'
+                      @click='calibrationAction(`verify_continue`)'>Continue to splitter</button>
+              <button v-if='state.calibration.state === `verify_splitter`' class='primary'
+                      :disabled='!!calibrationUi.busy'
+                      @click='calibrationAction(`verify_continue`)'>Splitter confirmed · return to ACE</button>
+            </div>
+          </template>
+
+                <template v-else-if='calibrationRouteKnown'>
+                  <div class='calibration-checks'>
+                    <div :class='{ok: calibrationSelectedSlot?.state === `ready`}'>
+                      Slot {{ dispIdx(calibrationUi.slot) }} is
+                      {{ calibrationSelectedSlot?.state === 'ready'
+                        ? 'parked at ACE preload' : calibrationSelectedSlot?.state }}
+                    </div>
+                    <div :class='{ok: calibrationSelectedHeadClear}'>
+                      T{{ dispIdx(calibrationUi.head) }} toolhead sensor is
+                      {{ calibrationSelectedHeadClear ? 'clear' : 'not clear' }}
+                    </div>
+                    <div class='ok'>Saved route values are valid</div>
+                    <div :class='{ok: state.printer_state !== `printing`
+                      && state.printer_state !== `paused`
+                      && !state.swap_in_progress
+                      && !(state.bg_swap?.busy || []).length}'>
+                      Printer and filament queue are idle
+                    </div>
+                  </div>
+                  <p class='calibration-notice'>
+                    <strong>What will happen</strong>
+                    Three continuous moves with manual stops at the toolhead and splitter.
+                    Verification can be paused or cancelled while moving.
+                  </p>
+                  <p v-if='calibrationVerifyBlockedReason'
+                     class='calibration-warning'>
+                    {{ calibrationVerifyBlockedReason }}
+                  </p>
+                  <div class='row calibration-primary-actions'>
+                    <button class='primary'
+                            :disabled='!calibrationCanVerifyConfigured
+                              || !!calibrationUi.busy'
+                            @click='calibrationVerifyConfigured'>
+                      {{ calibrationUi.busy === 'verify_start'
+                        ? 'Starting verification…'
+                        : state.calibration.state === 'verified'
+                          ? 'Verify again' : 'Start verification' }}
+                    </button>
+                    <button @click='calibrationSetPanel(`setup`)'>Review route</button>
+                  </div>
+                  <details class='calibration-details'>
+                    <summary>Advanced verification details</summary>
+                    <p>Toolhead {{ calibrationRouteAnchors.load }} mm · splitter
+                      {{ calibrationRouteAnchors.load - calibrationRouteAnchors.swap }} mm
+                      · correction limit ±{{ state.calibration.verify_fine_limit_mm || 50 }} mm.
+                      Encoder telemetry is diagnostic only.</p>
+                  </details>
+                </template>
+                <template v-else>
+                  <p class='calibration-warning'>
+                    This route has no valid saved toolhead and splitter anchors yet.
+                  </p>
+                  <div class='row calibration-primary-actions'>
+                    <button class='primary'
+                            @click='calibrationBeginRecalibration'>
+                      Calibrate this route
+                    </button>
+                    <button @click='calibrationSetPanel(`setup`)'>Review route</button>
+                  </div>
+                </template>
+
+                <button v-if='calibrationMoving
+                        || [`verify_toolhead`, `verify_toolhead_adjust`,
+                            `verify_splitter`, `verify_paused`]
+                          .includes(state.calibration.state)'
+                        class='calibration-stop'
+                        @click='calibrationAction(`cancel`)'>
+                  Stop &amp; cancel
+                </button>
+              </section>
+
+              <section v-show='calibrationUi.panel === `results`'
+                       class='calibration-panel'>
+                <div class='calibration-task-heading'>
+                  <div>
+                    <small>Results</small>
+                    <h3>{{ state.calibration.state === 'verified'
+                      ? 'Verification passed' : 'Calibration results' }}</h3>
+                    <p>Review the active route values and decide whether to verify, recalibrate, or save them.</p>
+                  </div>
+                </div>
+
+          <template v-if='[`complete`, `verified`].includes(state.calibration.state)'>
+            <p class='calibration-warning'>The full retract is inferred by returning the same measured distance used to reach the toolhead sensor. Repeat the calibration if you want to compare preload repeatability before applying.</p>
+            <p v-if='state.calibration.state === `verified`' class='calibration-success'>Continuous verification round trip completed and returned to the ACE preload reference.</p>
+            <p v-if='state.calibration.state === `verified` && state.calibration.verify_feed_delta_mm != null' class='muted'>Verified toolhead endpoint correction: {{ state.calibration.verify_feed_delta_mm >= 0 ? '+' : '' }}{{ state.calibration.verify_feed_delta_mm }} mm. This diagnostic has not been applied to the calibration values.</p>
+            <p v-if='state.calibration.protocol === `v2`' class='muted'>Encoder return delta: {{ state.calibration.decoder_return_delta ?? '—' }} counts (diagnostic only).</p>
+            <div class='calibration-allowances'>
+              <label>Load allowance <input type='number' min='0' max='200' v-model.number='calibrationUi.loadAllowance'> mm</label>
+              <label>Splitter clearance <input type='number' min='0' max='200' v-model.number='calibrationUi.swapAllowance'> mm</label>
+            </div>
+            <table class='calibration-review'>
+              <thead><tr><th>Config value</th><th>Previous</th><th>Measured</th><th>Proposed</th></tr></thead>
+              <tbody>
+                <tr><td>load_length</td><td>{{ state.calibration.previous_load_length }}</td><td>{{ state.calibration.load_length_mm }}</td><td>{{ calibrationProposed.load }}</td></tr>
+                <tr><td>swap_retract_length</td><td>{{ state.calibration.previous_swap_retract_length }}</td><td>{{ state.calibration.swap_retract_length_mm }}</td><td>{{ calibrationProposed.swap }}</td></tr>
+                <tr><td>retract_length</td><td>{{ state.calibration.previous_retract_length }}</td><td>{{ state.calibration.retract_length_mm }}</td><td>{{ calibrationProposed.retract }}</td></tr>
+              </tbody>
+            </table>
+            <p v-if='calibrationUi.saved' class='calibration-success'>Saved with a backup. Restart the printer to apply the new values.</p>
+            <div class='row'>
+              <button :disabled='!!calibrationUi.busy || !calibrationCanVerifyConfigured'
+                      @click='calibrationVerifyConfigured'>
+                {{ state.calibration.state === 'verified' ? 'Verify again' : 'Start verification' }}
+              </button>
+              <button class='primary' :disabled='!!calibrationUi.busy || calibrationUi.saved'
+                      @click='calibrationApply'>
+                {{ calibrationUi.busy === 'apply' ? 'Saving…' : 'Apply to config' }}
+              </button>
+              <button :disabled='!!calibrationUi.busy' @click='calibrationAction(`reset`)'>Discard / new session</button>
+            </div>
+          </template>
+
+                <template v-else-if='calibrationRouteKnown'>
+                  <p class='calibration-notice'>
+                    <strong>Saved calibration</strong>
+                    No new calibration or verification result exists in this session.
+                    The configured route remains available for verification.
+                  </p>
+                  <div class='calibration-metrics'>
+                    <div><small>Toolhead distance</small><strong>{{ calibrationRouteAnchors.load }} mm</strong></div>
+                    <div><small>Splitter retract</small><strong>{{ calibrationRouteAnchors.swap }} mm</strong></div>
+                    <div><small>Final position</small><strong>{{ calibrationTipPositionMm === 0 ? 'Parked' : 'Unknown' }}</strong></div>
+                  </div>
+                  <div class='row calibration-primary-actions'>
+                    <button class='primary'
+                            @click='calibrationSetPanel(`verify`)'>Verify saved calibration</button>
+                    <button @click='calibrationBeginRecalibration'>Recalibrate this route</button>
+                  </div>
+                </template>
+                <template v-else>
+                  <p class='calibration-notice'>
+                    No saved values or session results exist for this route.
+                  </p>
+                  <div class='row calibration-primary-actions'>
+                    <button class='primary'
+                            @click='calibrationBeginRecalibration'>Start calibration</button>
+                    <button @click='calibrationSetPanel(`setup`)'>Review route</button>
+                  </div>
+                </template>
+              </section>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
     <section v-show="tab==='spools'">
       <h2>{{ t('ui.spools.title') }}

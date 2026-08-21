@@ -205,6 +205,10 @@ Before installing multiACE, ensure the following:
    ```
    bash /tmp/multiace/install_multiace.sh
    ```
+   or for web
+   ```
+   bash /tmp/multiace/install_multiace.sh --install-web --keep-config
+   ```
 4. Reboot the printer
 5. multiACE starts in **Multi mode** - all connected ACE units are detected automatically
 

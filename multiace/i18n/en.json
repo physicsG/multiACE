@@ -13,6 +13,7 @@
     },
     "tabs": {
       "dashboard": "Dashboard",
+      "calibration": "Calibration",
       "dry": "Dry",
       "config": "Config",
       "display": "Display",

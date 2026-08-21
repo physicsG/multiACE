@@ -5,7 +5,7 @@ const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://")
 const SCREEN = "/screen";
 createApp({
   setup() {
-    const _validTabs = new Set(["dashboard", "spools", "config"]);
+    const _validTabs = new Set(["dashboard", "calibration", "spools", "config"]);
     const _storedTab = localStorage.getItem("multiace.tab");
     const _isPluginTab = (s) => typeof s === "string" && s.startsWith("plugin:");
     const tab = ref(
@@ -171,6 +171,7 @@ createApp({
       spool_binding: {},
       auto_dry_masters: [],
       tipform: {available: false, mode: null, tables: []},
+      calibration: {state: "idle", session_id: 0},
       // Send-to-multiACE inbox: a slicer-pushed gcode waiting for pickup.
       preflight_inbox: {pending: false, name: null, size: 0, ts: 0},
     });
@@ -277,8 +278,11 @@ createApp({
       state.head_ace      = (s.head_ace && typeof s.head_ace === "object") ? s.head_ace : {};
       state.dryer         = s.dryer ?? null;
       state.swap_in_progress = !!s.swap_in_progress;
+      state.calibration    = (s.calibration && typeof s.calibration === "object")
+        ? s.calibration : {state: "idle", session_id: 0};
       state.aces          = Array.isArray(s.aces) ? s.aces : [];
       state.toolheads     = Array.isArray(s.toolheads) ? s.toolheads : [];
+      syncCalibrationDefaults();
       state.wiring        = Array.isArray(s.wiring) ? s.wiring : [];
       state.save_variables = s.save_variables || {};
       state.bg_swap       = (s.bg_swap && typeof s.bg_swap === "object")
@@ -460,6 +464,574 @@ createApp({
       _scheduleAdvance();
     }
     function run(name, args) { return enqueue(name, args); }
+
+    const calibrationUi = reactive({
+      ace: 0, slot: 0, head: 0, scope: 'ace',
+      loadAllowance: 20, swapAllowance: 20,
+      baselinePrepared: false, routeConfirmed: false,
+      panel: 'setup', panelTouched: false, recalibrate: false,
+      busy: '', cancelRequested: false, error: '', saved: false,
+    });
+    const calibrationSelectionTouched = reactive({
+      ace: false, slot: false, head: false,
+    });
+    const connectedCalibrationAces = computed(() =>
+      state.aces.filter(a => a && a.connected));
+    const calibrationSelectedAce = computed(() =>
+      state.aces.find(a => Number(a.idx) === Number(calibrationUi.ace)) || null);
+    const calibrationSelectedToolhead = computed(() =>
+      state.toolheads.find(
+        h => Number(h.idx) === Number(calibrationUi.head)) || null);
+    const calibrationSelectedSlot = computed(() =>
+      calibrationSelectedAce.value?.slots?.find(
+        slot => Number(slot.idx) === Number(calibrationUi.slot)) || null);
+    const calibrationVerifyMoving = computed(() =>
+      ['verifying_feed', 'verifying_splitter', 'verifying_return']
+        .includes(state.calibration?.state));
+    const calibrationMoving = computed(() =>
+      ['feeding', 'retracting', 'returning'].includes(state.calibration?.state)
+        || calibrationVerifyMoving.value
+        || state.calibration?.state === 'verify_toolhead_adjusting');
+    const calibrationRouteLocked = computed(() => {
+      const c = state.calibration || {};
+      const position = Number(c.tip_position_mm);
+      const tipAwayFromPark = Number.isFinite(position) && position > 0;
+      const nonParkedState = [
+        'feeding', 'at_sensor', 'retract_ready', 'retracting',
+        'swap_marked', 'returning', 'verifying_feed', 'verify_toolhead',
+        'verify_toolhead_adjust', 'verify_toolhead_adjusting',
+        'verifying_splitter', 'verify_splitter', 'verifying_return',
+        'verify_paused', 'cancelled', 'failed',
+      ].includes(c.state);
+      return c.ace != null && c.slot != null && c.head != null
+        && (tipAwayFromPark || nonParkedState);
+    });
+    const calibrationSelectedHeadSensorKnown = computed(() =>
+      typeof calibrationSelectedToolhead.value?.filament_at_extruder === 'boolean');
+    const calibrationSelectedHeadClear = computed(() =>
+      calibrationSelectedToolhead.value?.filament_at_extruder === false);
+    const calibrationCanPrepare = computed(() => {
+      const ace = calibrationSelectedAce.value;
+      const toolhead = calibrationSelectedToolhead.value;
+      return !!ace && ace.connected
+        && !!toolhead && !toolhead.manual && !toolhead.feeder
+        && calibrationSelectedHeadSensorKnown.value
+        && state.mode !== 'normal'
+        && !['printing', 'paused'].includes(state.printer_state)
+        && !state.swap_in_progress
+        && !(state.bg_swap?.busy || []).length
+        && !calibrationMoving.value;
+    });
+    const calibrationCanStart = computed(() => {
+      const ace = calibrationSelectedAce.value;
+      const toolhead = calibrationSelectedToolhead.value;
+      const slot = ace?.slots?.find(
+        s => Number(s.idx) === Number(calibrationUi.slot));
+      return !!ace && ace.connected
+        && calibrationUi.baselinePrepared
+        && calibrationUi.routeConfirmed
+        && calibrationSelectedHeadClear.value
+        && state.mode !== 'normal'
+        && !['printing', 'paused'].includes(state.printer_state)
+        && !state.swap_in_progress
+        && !(state.bg_swap?.busy || []).length
+        && !!slot && slot.state === 'ready'
+        && toolhead?.filament_at_extruder === false
+        && !toolhead?.manual && !toolhead?.feeder
+        && !calibrationMoving.value;
+    });
+    const calibrationCanVerifyConfigured = computed(() => {
+      const ace = calibrationSelectedAce.value;
+      const toolhead = calibrationSelectedToolhead.value;
+      const slot = calibrationSelectedSlot.value;
+      return ['idle', 'cancelled', 'failed', 'complete', 'verified']
+        .includes(state.calibration?.state)
+        && calibrationRouteKnown.value
+        && !!ace && ace.connected
+        && !!slot && slot.state === 'ready'
+        && calibrationSelectedHeadClear.value
+        && !!toolhead && !toolhead.manual && !toolhead.feeder
+        && state.mode !== 'normal'
+        && !['printing', 'paused'].includes(state.printer_state)
+        && !state.swap_in_progress
+        && !(state.bg_swap?.busy || []).length
+        && !calibrationMoving.value;
+    });
+    const calibrationProposed = computed(() => {
+      const c = state.calibration || {};
+      return {
+        load: c.load_length_mm == null ? null
+          : Number(c.load_length_mm) + Math.max(0, Number(calibrationUi.loadAllowance) || 0),
+        swap: c.swap_retract_length_mm == null ? null
+          : Number(c.swap_retract_length_mm) + Math.max(0, Number(calibrationUi.swapAllowance) || 0),
+        retract: c.retract_length_mm == null ? null : Number(c.retract_length_mm),
+      };
+    });
+    const calibrationConfiguredRoute = computed(() => {
+      const ace = Number(calibrationUi.ace);
+      const slot = Number(calibrationUi.slot);
+      const aceCfg = configForm.perAce?.[ace] || {};
+      const slotCfg = aceCfg.perSlot?.[slot] || {};
+      const effective = (key) => {
+        for (const value of [slotCfg[key], aceCfg[key], configForm[key]]) {
+          if (value !== '' && value != null && Number.isFinite(Number(value))
+              && Number(value) > 0) return Number(value);
+        }
+        return null;
+      };
+      return {
+        load: effective('retract_length'),
+        feedLimit: effective('load_length'),
+        swap: effective('swap_retract_length'),
+      };
+    });
+    const calibrationSessionMatchesSelection = computed(() => {
+      const c = state.calibration || {};
+      return Number(c.ace) === Number(calibrationUi.ace)
+        && Number(c.slot) === Number(calibrationUi.slot)
+        && Number(c.head) === Number(calibrationUi.head)
+        && String(c.scope || 'ace') === String(calibrationUi.scope || 'ace');
+    });
+    const calibrationRouteAnchors = computed(() => {
+      const c = state.calibration || {};
+      const measuredLoad = !calibrationSessionMatchesSelection.value
+        || c.load_length_mm == null ? null : Number(c.load_length_mm);
+      const measuredSwap = !calibrationSessionMatchesSelection.value
+        || c.swap_retract_length_mm == null
+        ? null : Number(c.swap_retract_length_mm);
+      const load = Number.isFinite(measuredLoad) && measuredLoad > 0
+        ? measuredLoad : calibrationConfiguredRoute.value.load;
+      const swap = Number.isFinite(measuredSwap) && measuredSwap > 0
+        ? measuredSwap : calibrationConfiguredRoute.value.swap;
+      return {load, swap, source: measuredLoad > 0 && measuredSwap > 0
+        ? 'measured' : 'configured'};
+    });
+    const calibrationRouteKnown = computed(() => {
+      const {load, swap} = calibrationRouteAnchors.value;
+      return Number.isFinite(load) && Number.isFinite(swap)
+        && load > 0 && swap > 0 && swap < load;
+    });
+    const calibrationVerifyBlockedReason = computed(() => {
+      if (!calibrationRouteKnown.value) return 'Save a calibration for this route first.';
+      if (!calibrationSelectedAce.value?.connected) return 'The selected ACE is not connected.';
+      if (calibrationSelectedSlot.value?.state !== 'ready') {
+        return 'Return the selected slot to its automatic-preload position.';
+      }
+      if (!calibrationSelectedHeadSensorKnown.value) {
+        return 'The mapped toolhead sensor is unavailable.';
+      }
+      if (!calibrationSelectedHeadClear.value) return 'Unload the mapped toolhead first.';
+      if (calibrationSelectedToolhead.value?.manual
+          || calibrationSelectedToolhead.value?.feeder) {
+        return 'Select an ACE-driven toolhead.';
+      }
+      if (state.mode === 'normal') return 'Switch multiACE out of normal mode.';
+      if (['printing', 'paused'].includes(state.printer_state)) {
+        return 'Wait until the printer is idle.';
+      }
+      if (state.swap_in_progress || (state.bg_swap?.busy || []).length) {
+        return 'Wait for the active filament operation to finish.';
+      }
+      if (!['idle', 'cancelled', 'failed', 'complete', 'verified']
+          .includes(state.calibration?.state)) {
+        return 'Finish or cancel the current calibration first.';
+      }
+      return '';
+    });
+    const calibrationTabStatus = computed(() => {
+      const c = state.calibration || {};
+      const measuring = ['prepared', 'feeding', 'at_sensor', 'retract_ready',
+        'retracting', 'swap_marked', 'returning'].includes(c.state);
+      const verifying = ['verifying_feed', 'verify_toolhead',
+        'verify_toolhead_adjust', 'verify_toolhead_adjusting',
+        'verifying_splitter', 'verify_splitter', 'verifying_return',
+        'verify_paused'].includes(c.state);
+      return {
+        setup: calibrationRouteKnown.value ? 'Route ready' : 'Choose route',
+        calibrate: measuring ? 'In progress'
+          : calibrationRouteKnown.value ? 'Values available' : 'Required',
+        verify: verifying ? 'In progress'
+          : c.state === 'verified' ? 'Passed'
+            : calibrationRouteKnown.value ? 'Available' : 'Needs values',
+        results: c.state === 'verified' ? 'Passed'
+          : c.state === 'complete' ? 'Review values' : 'No new result',
+      };
+    });
+    const calibrationTipPositionMm = computed(() => {
+      if (!calibrationRouteKnown.value) return null;
+      const c = state.calibration || {};
+      const load = calibrationRouteAnchors.value.load;
+      if (c.tip_position_mm != null && Number.isFinite(Number(c.tip_position_mm))) {
+        const fineLimit = Math.max(0, Number(c.verify_fine_limit_mm) || 50);
+        return Math.max(0, Math.min(load + fineLimit, Number(c.tip_position_mm)));
+      }
+      if (calibrationSelectedToolhead.value?.filament_at_extruder === true) return load;
+      if (['complete', 'verified'].includes(c.state)) return 0;
+      const slot = calibrationSelectedAce.value?.slots?.find(
+        item => Number(item.idx) === Number(calibrationUi.slot));
+      if (slot?.state === 'ready'
+          && calibrationSelectedToolhead.value?.filament_at_extruder === false) return 0;
+      return null;
+    });
+    const calibrationTipSegment = computed(() => {
+      const position = calibrationTipPositionMm.value;
+      if (position == null) return 'ace';
+      const {load, swap} = calibrationRouteAnchors.value;
+      const splitter = load - swap;
+      return position <= splitter ? 'ace' : 'toolhead';
+    });
+    const calibrationTipSegmentPercent = computed(() => {
+      const position = calibrationTipPositionMm.value;
+      if (position == null) return 50;
+      const {load, swap} = calibrationRouteAnchors.value;
+      const splitter = load - swap;
+      const percent = position <= splitter
+        ? (splitter > 0 ? 100 * position / splitter : 0)
+        : (swap > 0 ? 100 * (position - splitter) / swap : 0);
+      return Math.max(0, Math.min(100, percent));
+    });
+    const calibrationTipLabel = computed(() => {
+      const c = state.calibration || {};
+      const position = calibrationTipPositionMm.value;
+      if (!calibrationRouteKnown.value) return 'No configured calibration anchors for this route';
+      if (position == null) return 'Configured route known · current tip position unavailable';
+      if (c.state === 'verify_paused') {
+        return `Paused · estimated ${Math.round(position)} mm from ACE preload`;
+      }
+      if (c.state === 'verify_toolhead_adjust') {
+        const offset = Number(c.verify_fine_offset_mm) || 0;
+        return `Toolhead endpoint adjustment · ${offset >= 0 ? '+' : ''}${offset} mm`;
+      }
+      if (c.state === 'verify_toolhead_adjusting') {
+        return `Fine positioning · estimated ${Math.round(position)} mm from ACE preload`;
+      }
+      if (c.state === 'verify_toolhead') return 'Held at the toolhead sensor';
+      if (c.state === 'verify_splitter') return 'Held at the calibrated splitter checkpoint';
+      if (c.state === 'verified') return 'Verification complete · parked at ACE preload';
+      if (c.state === 'complete') return 'Parked at the ACE preload reference';
+      if (calibrationMoving.value) {
+        return `Moving · estimated ${Math.round(position)} mm from ACE preload`;
+      }
+      const source = calibrationRouteAnchors.value.source === 'configured'
+        ? 'Configured route' : 'Measured route';
+      return `${source} · estimated tip ${Math.round(position)} mm from ACE preload`;
+    });
+
+    watch(() => state.calibration?.state, (next, previous) => {
+      const verifying = ['verifying_feed', 'verify_toolhead',
+        'verify_toolhead_adjust', 'verify_toolhead_adjusting',
+        'verifying_splitter', 'verify_splitter', 'verifying_return',
+        'verify_paused'];
+      const measuring = ['prepared', 'feeding', 'at_sensor', 'retract_ready',
+        'retracting', 'swap_marked', 'returning'];
+      if (verifying.includes(next)) {
+        calibrationSetPanel('verify', false);
+      } else if (measuring.includes(next)) {
+        calibrationSetPanel('calibrate', false);
+      } else if (next === 'verified' && previous && previous !== 'verified') {
+        calibrationSetPanel('results', false);
+      } else if (next === 'complete' && previous === 'returning') {
+        calibrationSetPanel('results', false);
+      }
+    });
+
+    function calibrationResetPreparation() {
+      calibrationUi.baselinePrepared = false;
+      calibrationUi.routeConfirmed = false;
+    }
+    function calibrationSetPanel(panel, touched=true) {
+      if (!['setup', 'calibrate', 'verify', 'results'].includes(panel)) return;
+      calibrationUi.panel = panel;
+      if (touched) calibrationUi.panelTouched = true;
+    }
+    function calibrationContinueRoute() {
+      calibrationSetPanel(calibrationRouteKnown.value ? 'verify' : 'calibrate');
+    }
+    function calibrationBeginRecalibration() {
+      calibrationUi.recalibrate = true;
+      calibrationUi.error = '';
+      calibrationSetPanel('calibrate');
+    }
+    function calibrationKeepSaved() {
+      calibrationUi.recalibrate = false;
+      calibrationUi.error = '';
+    }
+    function calibrationSetScope(scope) {
+      if (calibrationRouteLocked.value || calibrationUi.busy
+          || !['ace', 'slot'].includes(scope)) return;
+      calibrationUi.scope = scope;
+      calibrationResetPreparation();
+      calibrationUi.recalibrate = false;
+    }
+    function calibrationRouteChanged() {
+      if (!calibrationRouteLocked.value) {
+        calibrationResetPreparation();
+        calibrationUi.recalibrate = false;
+      }
+    }
+
+    function syncCalibrationDefaults() {
+      if (calibrationRouteLocked.value) {
+        const c = state.calibration || {};
+        calibrationUi.ace = Number(c.ace);
+        calibrationUi.slot = Number(c.slot);
+        calibrationUi.head = Number(c.head);
+        calibrationUi.scope = c.scope === 'slot' ? 'slot' : 'ace';
+        return;
+      }
+      const connected = state.aces.filter(ace => ace?.connected);
+      if (!connected.length) return;
+      let selected = connected.find(
+        ace => Number(ace.idx) === Number(calibrationUi.ace));
+      if (!selected || (connected.length === 1 && !calibrationSelectionTouched.ace)) {
+        selected = connected[0];
+        calibrationUi.ace = Number(selected.idx);
+      }
+      if (!calibrationSelectionTouched.slot) {
+        const ready = (selected.slots || []).find(slot => slot.state === 'ready');
+        if (ready) calibrationUi.slot = Number(ready.idx);
+      }
+      if (state.mode === 'multi') {
+        calibrationUi.head = Number(calibrationUi.slot);
+        return;
+      }
+      if (connected.length !== 1) return;
+      const mappedHeads = (state.ace_heads || []).filter(head =>
+        Number(state.head_ace?.[String(head)] ?? state.head_ace?.[head] ?? head)
+          === Number(selected.idx));
+      const mapped = mappedHeads.find(head => {
+        const toolhead = state.toolheads.find(
+          item => Number(item.idx) === Number(head));
+        return toolhead && !toolhead.manual && !toolhead.feeder;
+      }) ?? mappedHeads[0];
+      if (mapped != null && (!calibrationSelectionTouched.head
+          || !mappedHeads.some(head => Number(head) === Number(calibrationUi.head)))) {
+        calibrationUi.head = Number(mapped);
+      }
+    }
+    async function calibrationPrepare() {
+      calibrationUi.busy = 'prepare';
+      calibrationUi.cancelRequested = false;
+      calibrationUi.error = '';
+      calibrationResetPreparation();
+      try {
+        if (['cancelled', 'failed'].includes(state.calibration?.state)) {
+          const resetOk = await calibrationRequest('action', {
+            action: 'reset',
+            session_id: Number(state.calibration?.session_id || 0),
+          }, 'prepare');
+          calibrationUi.busy = 'prepare';
+          if (!resetOk) return;
+        }
+        if (calibrationSelectedHeadClear.value) return;
+        const ok = await run('ACE_UNLOAD_HEAD', {
+          HEAD: Number(calibrationUi.head),
+          ACE: Number(calibrationUi.ace),
+          SLOT: Number(calibrationUi.slot),
+          CALIBRATION_PREPARE: 1,
+        });
+        await reloadState();
+        if (calibrationUi.cancelRequested) {
+          throw new Error(
+            'Preparation unload cancelled. Verify the filament position '
+            + 'before establishing a new baseline.');
+        }
+        if (!ok || !calibrationSelectedHeadClear.value) {
+          throw new Error(
+            'Preparation did not produce a clear selected-toolhead baseline. '
+            + 'Resolve the loaded or unknown sensor, then try again.');
+        }
+      } catch (e) {
+        calibrationUi.error = String(e?.message || e);
+      } finally {
+        calibrationUi.busy = '';
+        calibrationUi.cancelRequested = false;
+      }
+    }
+    async function calibrationConfirmBaseline() {
+      if (!calibrationCanPrepare.value || !calibrationSelectedHeadClear.value
+          || calibrationUi.busy) return;
+      calibrationUi.busy = 'confirm-baseline';
+      calibrationUi.error = '';
+      calibrationResetPreparation();
+      try {
+        if (['cancelled', 'failed'].includes(state.calibration?.state)) {
+          const resetOk = await calibrationRequest('action', {
+            action: 'reset',
+            session_id: Number(state.calibration?.session_id || 0),
+          }, 'confirm-baseline');
+          calibrationUi.busy = 'confirm-baseline';
+          if (!resetOk) return;
+        }
+        await reloadState();
+        if (!calibrationSelectedHeadClear.value) {
+          throw new Error(
+            'The selected toolhead sensor is no longer clear. Unload the '
+            + 'selected toolhead before confirming the starting point.');
+        }
+        calibrationUi.baselinePrepared = true;
+      } catch (e) {
+        calibrationUi.error = String(e?.message || e);
+      } finally {
+        calibrationUi.busy = '';
+      }
+    }
+    async function calibrationCancelPrepare() {
+      if (calibrationUi.busy !== 'prepare' || calibrationUi.cancelRequested) return;
+      calibrationUi.cancelRequested = true;
+      calibrationUi.error = '';
+      try {
+        const r = await fetch(`${API}/calibration/unload-cancel`, {method: 'POST'});
+        let j = null;
+        try { j = await r.json(); } catch (_) {}
+        if (!r.ok) throw new Error(j?.detail || `HTTP ${r.status}`);
+      } catch (e) {
+        calibrationUi.cancelRequested = false;
+        calibrationUi.error = String(e?.message || e);
+      }
+    }
+    function calibrationConfirmRoute() {
+      if (!calibrationUi.baselinePrepared || calibrationMoving.value) return;
+      calibrationUi.routeConfirmed = !calibrationUi.routeConfirmed;
+      calibrationUi.error = '';
+    }
+
+    function calibrationSelectAce(idx) {
+      if (calibrationRouteLocked.value || calibrationUi.busy) return;
+      calibrationSelectionTouched.ace = true;
+      calibrationUi.ace = Number(idx);
+      calibrationResetPreparation();
+      if (state.mode === 'head') {
+        const h = (state.ace_heads || []).find(
+          head => Number(state.head_ace?.[String(head)] ?? state.head_ace?.[head] ?? head)
+            === Number(idx));
+        if (h != null) calibrationUi.head = Number(h);
+      }
+      calibrationUi.error = '';
+      calibrationUi.saved = false;
+      calibrationUi.recalibrate = false;
+    }
+    function calibrationSelectSlot(idx) {
+      if (calibrationRouteLocked.value || calibrationUi.busy) return;
+      calibrationSelectionTouched.slot = true;
+      calibrationUi.slot = Number(idx);
+      calibrationResetPreparation();
+      if (state.mode === 'multi') calibrationUi.head = Number(idx);
+      calibrationUi.error = '';
+      calibrationUi.saved = false;
+      calibrationUi.recalibrate = false;
+    }
+    function calibrationSelectHead() {
+      if (calibrationRouteLocked.value || calibrationUi.busy) return;
+      calibrationSelectionTouched.head = true;
+      calibrationRouteChanged();
+      calibrationUi.error = '';
+      calibrationUi.saved = false;
+    }
+    async function calibrationRequest(path, body, busy) {
+      calibrationUi.busy = busy;
+      calibrationUi.error = '';
+      try {
+        const r = await fetch(`${API}/calibration/${path}`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(body || {}),
+        });
+        let j = null;
+        try { j = await r.json(); } catch (_) {}
+        if (!r.ok) throw new Error(j?.detail || `HTTP ${r.status}`);
+        await reloadState();
+        return true;
+      } catch (e) {
+        let message = String(e?.message || e);
+        if (body?.action === 'verify_start'
+            && /complete calibration before verification/i.test(message)) {
+          message = 'Klipper is still running the previous calibration code. '
+            + 'Restart Klipper or reboot the printer, then retry verification.';
+        }
+        calibrationUi.error = message;
+        return false;
+      } finally {
+        calibrationUi.busy = '';
+      }
+    }
+    async function calibrationStart() {
+      calibrationUi.saved = false;
+      calibrationSetPanel('calibrate', false);
+      const ok = await calibrationRequest('start', {
+        ace: Number(calibrationUi.ace),
+        slot: Number(calibrationUi.slot),
+        head: Number(calibrationUi.head),
+        scope: calibrationUi.scope,
+      }, 'start');
+      if (ok) await calibrationAction('feed');
+    }
+    async function calibrationVerifyConfigured() {
+      if (!calibrationCanVerifyConfigured.value) return false;
+      calibrationSetPanel('verify', false);
+      return calibrationRequest('action', {
+        action: 'verify_start',
+        session_id: Number(state.calibration?.session_id || 0),
+        ace: Number(calibrationUi.ace),
+        slot: Number(calibrationUi.slot),
+        head: Number(calibrationUi.head),
+        scope: calibrationUi.scope,
+      }, 'verify_start');
+    }
+    async function calibrationAction(action, length=null) {
+      const ok = await calibrationRequest('action', {
+        action, length,
+        session_id: Number(state.calibration?.session_id || 0),
+      }, action);
+      if (ok && ['cancel', 'reset'].includes(action)) {
+        calibrationResetPreparation();
+      }
+      return ok;
+    }
+    async function calibrationApply() {
+      const c = state.calibration || {};
+      const v = calibrationProposed.value;
+      calibrationUi.error = '';
+      if (!['complete', 'verified'].includes(c.state)
+          || v.load == null || v.swap == null
+          || v.retract == null) {
+        calibrationUi.error = 'Complete all calibration checkpoints first.';
+        return;
+      }
+      if (v.retract < v.swap) {
+        calibrationUi.error =
+          'Full retract must be at least the swap checkpoint plus its allowance.';
+        return;
+      }
+      const ace = Number(c.ace);
+      const slot = Number(c.slot);
+      if (configForm.ace_device_count <= ace) {
+        configForm.ace_device_count = ace + 1;
+      }
+      _ensurePerAceLength();
+      const target = configForm.perAce[ace];
+      if (!target) {
+        calibrationUi.error = 'Config form has no matching ACE section.';
+        return;
+      }
+      if (c.scope === 'slot') {
+        target.perSlot[slot].load_length = v.load;
+        target.perSlot[slot].swap_retract_length = v.swap;
+        target.perSlot[slot].retract_length = v.retract;
+      } else {
+        target.load_length = v.load;
+        target.swap_retract_length = v.swap;
+        target.retract_length = v.retract;
+      }
+      calibrationUi.busy = 'apply';
+      await saveConfigForm();
+      calibrationUi.busy = '';
+      calibrationUi.saved = rebootNeeded.value;
+      if (!calibrationUi.saved) {
+        calibrationUi.error = configLog.value || 'Config save failed.';
+      }
+    }
+
     function clearAllErrors() {
       cmdQueue.value = cmdQueue.value.filter(it => it.status !== 'error');
       cmdPaused.value = false;
@@ -883,6 +1455,12 @@ createApp({
       if (!_confirmCmd("ui.confirm.unload_all")) return;
       run("ACE_UNLOAD_ALL_HEADS");
     }
+    function cancelUnloadAll() {
+      run("ACE_UNLOAD_ALL_CANCEL");
+    }
+    const anyUnloading = computed(() =>
+      Object.values(toolheadOps.value).some(op => op === 'unloading')
+    );
     // The three head-mode setters used to swallow the outcome entirely
     // (empty catch, no res.ok, fire-and-forget reload). A REFUSAL from the
     // engine - "unload it first", the 1:1 wiring collision - was therefore
@@ -3358,6 +3936,11 @@ createApp({
       }
     }
     watch(() => configForm.ace_device_count, _ensurePerAceLength, {immediate: true});
+    watch([() => tab.value, calibrationRouteKnown], ([activePage, routeKnown]) => {
+      if (activePage !== 'calibration' || calibrationUi.panelTouched
+          || state.calibration?.state !== 'idle') return;
+      calibrationSetPanel(routeKnown ? 'verify' : 'setup', false);
+    }, {immediate: true});
     // True after a config save, which needs a full printer restart to take
     // effect (a bare Klipper restart misses USB/serial + PAXX boot-script
     // changes). Drives the prominent top reboot banner; cleared once a restart
@@ -5190,7 +5773,9 @@ createApp({
       await loadNotifications();
       await refreshDebugState();
       await refreshPlugins();
-      if (state.mode === "normal" && tab.value === "dashboard") tab.value = "config";
+      if (state.mode === "normal" && ["dashboard", "calibration"].includes(tab.value)) {
+        tab.value = "config";
+      }
       wsConnect();
       if (window.ResizeObserver && wiringContainerEl.value) {
         resizeObserver = new ResizeObserver(() => recomputeWiring());
@@ -5232,10 +5817,28 @@ createApp({
       sourceLabel,
       tab, version, printerName, printerFw, connClass, connText, screenAvailable,
       state, loadError, run, macroLog,
+      calibrationUi, connectedCalibrationAces, calibrationSelectedAce,
+      calibrationSelectedSlot,
+      calibrationSelectedToolhead, calibrationMoving, calibrationRouteLocked,
+      calibrationVerifyMoving, calibrationRouteKnown, calibrationRouteAnchors,
+      calibrationVerifyBlockedReason, calibrationTabStatus,
+      calibrationTipPositionMm, calibrationTipSegment,
+      calibrationTipSegmentPercent, calibrationTipLabel,
+      calibrationSelectedHeadSensorKnown, calibrationSelectedHeadClear,
+      calibrationCanPrepare,
+      calibrationCanStart, calibrationCanVerifyConfigured, calibrationProposed,
+      calibrationSetPanel, calibrationContinueRoute,
+      calibrationBeginRecalibration, calibrationKeepSaved,
+      calibrationSetScope, calibrationRouteChanged, calibrationPrepare,
+      calibrationConfirmBaseline,
+      calibrationCancelPrepare, calibrationConfirmRoute,
+      calibrationSelectAce, calibrationSelectSlot, calibrationSelectHead,
+      calibrationStart,
+      calibrationVerifyConfigured, calibrationAction, calibrationApply,
       panelMode, panelAce, panelAceIdx, panelSlotHead, panelPages, panelPage, panelPageId, panelFeederHeads, setPanelPage,
       panelSlotHeadLoaded, panelSlotActive, panelSlotLabel, panelSlotOp,
       panelMini, fullUiHref,
-      slotTitle, switchAce, loadSlot, slotIsEmpty, loadFeederHead, slotLoadedInHead, loadAll, unloadHead, unloadAll, setHeadManual, setHeadFeeder, setHeadAce, headToggle, aceOptionsForHead, headAceOf, aceProtoTitle, visibleAces, openHeadPicker, isToolheadOccupied, needsReload, toolheadOps, bgEnabledFor, setBgHead, setPickupCleaning, setConfirmCommands, setAutoDry, autoDryValue, autoDryInput, autoDryCommit, autoDryPairInvalid, autoDryFieldError, autoDryEnable, autoDrySetMaster, autoDryMasters, spoolmanUrl, spoolmanBusy, spoolmanStatusText, saveSpoolmanUrl, setSpoolmanAuto, spoolmanSync,
+      slotTitle, switchAce, loadSlot, slotIsEmpty, loadFeederHead, slotLoadedInHead, loadAll, unloadHead, unloadAll, cancelUnloadAll, anyUnloading, setHeadManual, setHeadFeeder, setHeadAce, headToggle, aceOptionsForHead, headAceOf, aceProtoTitle, visibleAces, openHeadPicker, isToolheadOccupied, needsReload, toolheadOps, bgEnabledFor, setBgHead, setPickupCleaning, setConfirmCommands, setAutoDry, autoDryValue, autoDryInput, autoDryCommit, autoDryPairInvalid, autoDryFieldError, autoDryEnable, autoDrySetMaster, autoDryMasters, spoolmanUrl, spoolmanBusy, spoolmanStatusText, saveSpoolmanUrl, setSpoolmanAuto, spoolmanSync,
       spoolmanConnected, spoolmanUrlSet, setSpoolMode, smQuery, smRows, smBusy, smOpen, smSearchDebounced, smAdopt,
       smPing, smPingInfo, spoolmanPing, spoolQuery, smPick, smPickTarget, smAdoptStaged,
       spoolBadgeCls, spoolBadgeLabel, headTileEmpty, setAirprintDetection, setQuadReplenish, setQuadFirst, setPurgeMatrix, FILAMENT_SWATCHES, knownColors, sameSwatch, pickerRfidSku, pickerHeadTag, headRfidBusy, headRfidNote, readHeadRfid,

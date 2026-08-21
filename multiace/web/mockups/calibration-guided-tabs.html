@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang='en'>
+<head>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <title>multiACE guided calibration UX</title>
+  <style>
+    :root {
+      --bg: #181818; --panel: #232323; --deep: #1b1b1b;
+      --line: #383838; --fg: #ececec; --muted: #9b9b9b;
+      --accent: #15bdc6; --accent-ink: #001719;
+      --ok: #67dc79; --ok-bg: #17331d;
+      --warn: #ffc06b; --warn-bg: #382a14;
+      --danger: #ff7878; --danger-bg: #381b1b;
+      --shadow: 0 14px 38px rgba(0,0,0,.25);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--fg); background: var(--bg); font: 14px/1.45 system-ui, sans-serif; }
+    button { font: inherit; color: inherit; }
+    header {
+      position: sticky; top: 0; z-index: 5; display: flex; align-items: center;
+      gap: 18px; min-height: 58px; padding: 9px 18px; background: #222;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { font-size: 19px; font-weight: 750; white-space: nowrap; }
+    .brand i { color: var(--accent); font-style: normal; }
+    .top-nav { display: flex; gap: 5px; }
+    .top-nav span { padding: 7px 13px; border-radius: 4px; color: var(--muted); }
+    .top-nav .active { color: var(--accent-ink); background: var(--accent); }
+    .spacer { flex: 1; }
+    .online { color: var(--ok); font-size: 12px; }
+    .prototype {
+      padding: 8px 18px; text-align: center; color: #b8f5f7;
+      background: #102f31; border-bottom: 1px solid #28686c; font-size: 12px;
+      white-space: normal; overflow-wrap: anywhere;
+    }
+    main { width: min(1100px, calc(100% - 28px)); margin: 24px auto 60px; }
+    .page-head { display: flex; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+    h1 { margin: 0 0 5px; font-size: 23px; }
+    h2 { margin: 0 0 7px; font-size: 20px; }
+    h3 { margin: 0 0 6px; font-size: 15px; }
+    p { margin: 0; }
+    .muted { color: var(--muted); }
+    .pills { display: flex; align-items: flex-start; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+    .pill { padding: 5px 9px; border: 1px solid var(--line); border-radius: 99px; color: var(--muted); background: var(--panel); font-size: 12px; }
+    .pill.ok { color: var(--ok); border-color: #376e40; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); }
+
+    .route-card { padding: 16px 18px; margin-bottom: 14px; }
+    .route-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 15px; }
+    .route-head strong { display: block; font-size: 15px; }
+    .route-head small { color: var(--muted); }
+    .route-status { color: var(--ok); font-size: 12px; white-space: nowrap; }
+    .route {
+      display: grid; grid-template-columns: 130px 1fr 120px 1fr 130px;
+      align-items: center; gap: 10px;
+    }
+    .node { padding: 11px 8px; text-align: center; border-radius: 6px; background: var(--deep); border: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    .node b { display: block; color: var(--fg); font-size: 14px; }
+    .node.sensor-on { border-color: #3d8047; background: var(--ok-bg); }
+    .tube { height: 4px; border-radius: 5px; background: #4b4b4b; position: relative; }
+    .tube.active { background: linear-gradient(90deg, var(--accent) var(--fill, 0%), #4b4b4b var(--fill, 0%)); }
+    .tip {
+      position: absolute; left: var(--tip, 0%); top: 50%; width: 20px; height: 20px;
+      display: grid; place-items: center; transform: translate(-50%,-50%);
+      border-radius: 50%; background: var(--accent); color: var(--accent-ink);
+      border: 2px solid #111; font-size: 10px; transition: left .18s linear;
+    }
+    .route-caption { display: flex; justify-content: space-between; gap: 10px; margin-top: 12px; color: var(--muted); font-size: 12px; }
+    .route-caption strong { color: var(--fg); }
+
+    .workflow { overflow: hidden; }
+    .workflow-tabs { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); background: #202020; }
+    .workflow-tab {
+      appearance: none; border: 0; border-right: 1px solid var(--line); padding: 13px 12px;
+      background: transparent; text-align: left; cursor: pointer; color: var(--muted);
+    }
+    .workflow-tab:last-child { border-right: 0; }
+    .workflow-tab b { display: block; color: var(--fg); font-size: 14px; }
+    .workflow-tab small { display: block; margin-top: 2px; }
+    .workflow-tab.active { background: rgba(21,189,198,.1); box-shadow: inset 0 -3px var(--accent); }
+    .workflow-tab.active b { color: var(--accent); }
+    .workflow-tab .done { color: var(--ok); }
+    .workflow-body { padding: 22px; min-height: 385px; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .task-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; margin-bottom: 20px; }
+    .task-head p { color: var(--muted); max-width: 650px; }
+    .eyebrow { color: var(--accent); font-size: 11px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 5px; }
+    .recommended { color: var(--accent); border: 1px solid #347176; border-radius: 99px; padding: 5px 9px; white-space: nowrap; font-size: 11px; }
+    .notice { padding: 13px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--deep); margin: 14px 0; }
+    .notice.ok { color: #b9efc0; border-color: #376e40; background: var(--ok-bg); }
+    .notice.warn { color: #ffdaa8; border-color: #77582d; background: var(--warn-bg); }
+    .notice strong { display: block; color: inherit; margin-bottom: 2px; }
+    .checks { display: grid; gap: 7px; margin: 15px 0; }
+    .check { display: flex; align-items: center; gap: 9px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 5px; background: var(--deep); }
+    .check i { width: 20px; height: 20px; display: grid; place-items: center; border-radius: 50%; background: var(--ok-bg); color: var(--ok); font-style: normal; }
+    .check span { margin-left: auto; color: var(--muted); font-size: 12px; }
+    .actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-top: 18px; }
+    .btn { border: 1px solid var(--line); border-radius: 5px; padding: 9px 14px; background: #2b2b2b; cursor: pointer; }
+    .btn:hover { border-color: #666; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 750; }
+    .btn.large { padding: 12px 20px; font-size: 15px; }
+    .btn.danger { color: var(--danger); border-color: #754040; background: var(--danger-bg); }
+    .btn:disabled { opacity: .42; cursor: not-allowed; }
+    .link-btn { border: 0; padding: 5px; background: transparent; color: var(--accent); cursor: pointer; }
+    .choice-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .choice { padding: 13px; background: var(--deep); border: 1px solid var(--line); border-radius: 6px; }
+    .choice small { color: var(--muted); display: block; margin-top: 3px; }
+    .choice.selected { border-color: var(--accent); background: rgba(21,189,198,.08); }
+    .selector-block { margin-top: 16px; }
+    .selector-block > label { display: block; margin-bottom: 7px; color: var(--muted); font-size: 12px; }
+    .option-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .option-grid.two { grid-template-columns: repeat(2, 1fr); }
+    .route-option { padding: 11px; text-align: left; border: 1px solid var(--line); border-radius: 6px; background: var(--deep); cursor: pointer; }
+    .route-option b, .route-option small { display: block; }
+    .route-option small { margin-top: 2px; color: var(--muted); }
+    .route-option.selected { border-color: var(--accent); background: rgba(21,189,198,.08); }
+    .route-option:disabled { opacity: .38; cursor: not-allowed; }
+    .derived-route { display: flex; justify-content: space-between; gap: 12px; padding: 12px; margin-top: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--deep); }
+    .derived-route span { color: var(--muted); }
+    .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin: 15px 0; }
+    .metric { padding: 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--deep); }
+    .metric small { display: block; color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
+    .metric b { display: block; margin-top: 4px; font-size: 20px; }
+    .step-line { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 13px 0; }
+    .step-chip { padding: 8px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); background: var(--deep); font-size: 12px; }
+    .step-chip.active { color: var(--accent); border-color: #347176; }
+    .step-chip.done { color: var(--ok); border-color: #376e40; }
+    .progress { height: 7px; overflow: hidden; border-radius: 99px; background: #111; margin: 16px 0; }
+    .progress div { width: 0%; height: 100%; background: var(--accent); transition: width .2s; }
+    .fine { display: none; padding: 14px; border: 1px solid #77582d; border-radius: 6px; background: var(--warn-bg); margin-top: 14px; }
+    .fine.show { display: block; }
+    .fine-head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .fine-head span { color: var(--warn); }
+    .jog-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 9px; }
+    .jogs { display: flex; gap: 6px; flex-wrap: wrap; }
+    .jogs .btn { padding: 7px 10px; }
+    .hidden { display: none !important; }
+    details { margin-top: 18px; color: var(--muted); }
+    details summary { cursor: pointer; color: var(--fg); }
+    footer { margin-top: 14px; text-align: right; color: var(--muted); font-size: 11px; }
+    @media (max-width: 760px) {
+      .top-nav { display: none; }
+      .page-head, .task-head, .route-head, .route-caption { flex-direction: column; }
+      .route-head { align-items: flex-start; }
+      .pills { justify-content: flex-start; }
+      .route { grid-template-columns: minmax(72px,1fr) 18px minmax(72px,1fr) 18px minmax(72px,1fr); gap: 4px; }
+      .node { padding: 8px 4px; font-size: 10px; }
+      .node b { font-size: 11px; }
+      .tube { width: 100%; height: 3px; margin: 0; }
+      .tip { left: var(--tip, 0%); top: 50%; }
+      .workflow-tabs { grid-template-columns: 1fr 1fr; }
+      .workflow-tab:nth-child(2) { border-right: 0; }
+      .choice-row, .metrics, .step-line { grid-template-columns: 1fr; }
+      .option-grid { grid-template-columns: 1fr 1fr; }
+      .derived-route { flex-direction: column; }
+      .jog-row, .fine-head { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class='brand'>m<i>Ult1</i>ACE</div>
+    <div class='top-nav'><span>Dashboard</span><span class='active'>Calibration</span><span>Config</span></div>
+    <div class='spacer'></div><div class='online'>Printer connected</div>
+  </header>
+  <div class='prototype'>Interactive UX prototype &middot; no printer commands are sent</div>
+
+  <main>
+    <div class='page-head'>
+      <div><h1>Filament path</h1><p class='muted'>Set up, calibrate, and verify one route at a time.</p></div>
+      <div class='pills'><span class='pill ok'>ACE 1 connected</span><span class='pill'>T4 mapped</span><span class='pill ok'>Saved calibration</span></div>
+    </div>
+
+    <section class='card route-card'>
+      <div class='route-head'>
+        <div><strong id='routeTitle'>ACE 1 &middot; Slot 4 &rarr; Toolhead T4</strong><small id='routeMessage'>Filament parked at the ACE preload position</small></div>
+        <div id='routeStatus' class='route-status'>Ready</div>
+      </div>
+      <div class='route'>
+        <div class='node'><b id='aceRouteNode'>ACE 1 &middot; S4</b>automatic preload</div>
+        <div id='tubeA' class='tube active'><i id='tipA' class='tip'>●</i></div>
+        <div class='node'><b>4 &rarr; 1 splitter</b>shared junction</div>
+        <div id='tubeB' class='tube'><i id='tipB' class='tip hidden'>●</i></div>
+        <div id='headNode' class='node'><b>Toolhead T4</b><span id='sensorText'>sensor clear</span></div>
+      </div>
+      <div class='route-caption'><span>Configured anchors: splitter <strong>1320 mm</strong> &middot; toolhead <strong>1840 mm</strong></span><span><strong id='scopeLabel'>Slot 4 override</strong> &middot; <span id='tipLabel'>Tip position: parked</span></span></div>
+    </section>
+
+    <section class='card workflow'>
+      <div class='workflow-tabs' role='tablist'>
+        <button class='workflow-tab' data-tab='setup'><b>Setup</b><small class='done'>&#10003; Route ready</small></button>
+        <button class='workflow-tab' data-tab='calibrate'><b>Calibrate</b><small class='done'>&#10003; Values saved</small></button>
+        <button class='workflow-tab active' data-tab='verify'><b>Verify</b><small>Recommended next</small></button>
+        <button class='workflow-tab' data-tab='results'><b>Results</b><small id='resultsTabState'>No new result</small></button>
+      </div>
+      <div class='workflow-body'>
+        <section id='setupPanel' class='tab-panel'>
+          <div class='task-head'><div><div class='eyebrow'>Setup</div><h2>Choose one physical route</h2><p>The page remembers this path. You only need to return here when changing ACE, slot, or toolhead.</p></div></div>
+          <div class='selector-block'>
+            <label>ACE unit</label>
+            <div class='option-grid two'>
+              <button class='route-option ace-option selected' data-ace='1'><b>ACE 1</b><small>ACE 2 Pro &middot; connected</small></button>
+              <button class='route-option' disabled><b>ACE 2</b><small>Not connected</small></button>
+            </div>
+          </div>
+          <div class='selector-block'>
+            <label>Apply calibration to</label>
+            <div class='option-grid two'>
+              <button class='route-option scope-option' data-scope='ace'><b>Entire ACE unit</b><small>Shared defaults for every slot on ACE 1</small></button>
+              <button class='route-option scope-option selected' data-scope='slot'><b>Single Bowden tube</b><small>Override only the selected slot path</small></button>
+            </div>
+          </div>
+          <div class='selector-block'>
+            <label id='slotFieldLabel'>Bowden tube / filament slot</label>
+            <div class='option-grid'>
+              <button class='route-option slot-option' data-slot='1'><b>Slot 1</b><small>Ready &middot; saved calibration</small></button>
+              <button class='route-option slot-option' data-slot='2' disabled><b>Slot 2</b><small>Empty</small></button>
+              <button class='route-option slot-option' data-slot='3' disabled><b>Slot 3</b><small>Empty</small></button>
+              <button class='route-option slot-option selected' data-slot='4'><b>Slot 4</b><small>Ready &middot; saved calibration</small></button>
+            </div>
+          </div>
+          <div class='derived-route'><div><span>Connected toolhead</span><h3>Toolhead T4</h3></div><div><span id='derivedRouteHint'>Per-slot override</span><h3 id='derivedRoute'>ACE 1 &middot; Slot 4 &rarr; T4</h3></div></div>
+          <div class='checks'><div class='check'><i>&#10003;</i>Printer is idle<span>required</span></div><div class='check'><i>&#10003;</i>No other route is moving<span>required</span></div><div class='check'><i>&#10003;</i>T4 sensor is clear<span>required</span></div></div>
+          <div class='actions'><button class='btn primary large' data-go='verify'>Continue with this route</button></div>
+        </section>
+
+        <section id='calibratePanel' class='tab-panel'>
+          <div id='calibrateSummary'>
+            <div class='task-head'><div><div class='eyebrow'>Calibrate</div><h2>This route already has measurements</h2><p>Recalibration is optional. Verify the saved path first unless the tubes or splitter changed.</p></div><span class='recommended'>Saved 4 Aug</span></div>
+            <div class='metrics'><div class='metric'><small>Toolhead distance</small><b>1840 mm</b></div><div class='metric'><small>Splitter retract</small><b>520 mm</b></div><div class='metric'><small>Park return</small><b>1840 mm</b></div></div>
+            <div class='actions'><button class='btn primary large' data-go='verify'>Verify saved calibration</button><button id='recalibrateBtn' class='btn'>Recalibrate this route</button></div>
+          </div>
+          <div id='calibrateGuide' class='hidden'>
+            <div class='task-head'><div><div class='eyebrow'>Guided calibration</div><h2 id='calTitle'>Start from a clean path</h2><p id='calText'>Only T4 will be unloaded. Remove loose filament from the splitter after unloading.</p></div><span id='calCount' class='recommended'>Step 1 of 3</span></div>
+            <div class='step-line'><div id='calChip1' class='step-chip active'>1 &middot; Clean path</div><div id='calChip2' class='step-chip'>2 &middot; Confirm preload</div><div id='calChip3' class='step-chip'>3 &middot; Measure</div></div>
+            <div class='notice warn' id='calNotice'><strong>T4 contains filament</strong>The route must be clear before a new measurement.</div>
+            <div class='actions'><button id='calPrimary' class='btn primary large'>Unload selected T4</button><button id='cancelRecalibrate' class='link-btn'>Keep saved values</button></div>
+          </div>
+        </section>
+
+        <section id='verifyPanel' class='tab-panel active'>
+          <div class='task-head'><div><div class='eyebrow'>Verify</div><h2 id='verifyTitle'>Test the saved route</h2><p id='verifyLead'>The filament travels to T4, pauses at the toolhead and splitter, then returns to its parked position.</p></div><span class='recommended'>Recommended</span></div>
+          <div id='verifyReady'>
+            <div class='checks'><div class='check'><i>&#10003;</i><span id='verifySlotCheck' style='margin:0;color:inherit;font-size:inherit'>Slot 4 is parked at ACE preload</span><span>ready</span></div><div class='check'><i>&#10003;</i>T4 toolhead sensor is clear<span>ready</span></div><div class='check'><i>&#10003;</i>Saved route values are valid<span>ready</span></div></div>
+            <div class='notice'><strong>What will happen</strong>Three continuous moves with a manual stop at the toolhead and splitter. You can pause or cancel at any time.</div>
+            <div class='actions'><button id='startVerify' class='btn primary large'>Start verification</button><button class='link-btn' data-go='setup'>Review route</button></div>
+          </div>
+          <div id='verifyRun' class='hidden'>
+            <div class='step-line'><div id='vChip1' class='step-chip active'>1 &middot; Toolhead</div><div id='vChip2' class='step-chip'>2 &middot; Splitter</div><div id='vChip3' class='step-chip'>3 &middot; Return</div></div>
+            <div class='progress'><div id='verifyProgress'></div></div>
+            <div id='verifyNotice' class='notice'><strong>Moving toward T4</strong>The sensor is monitored continuously.</div>
+            <div id='finePanel' class='fine'>
+              <div class='fine-head'><div><strong>Expected endpoint reached &middot; sensor still clear</strong><p>Move the tip a small amount until T4 detects it.</p></div><span>Correction <b id='fineOffset'>+0 mm</b></span></div>
+              <div class='jog-row'><span>Toward toolhead</span><div class='jogs'><button class='btn jog' data-jog='1'>+1</button><button class='btn jog' data-jog='2'>+2</button><button class='btn jog' data-jog='5'>+5</button><button class='btn jog' data-jog='10'>+10 mm</button></div></div>
+              <div class='jog-row'><span>Toward ACE</span><div class='jogs'><button class='btn jog' data-jog='-1'>-1</button><button class='btn jog' data-jog='-2'>-2</button><button class='btn jog' data-jog='-5'>-5</button><button class='btn jog' data-jog='-10'>-10 mm</button></div></div>
+            </div>
+            <div class='actions'><button id='verifyPrimary' class='btn primary large hidden'>Continue to splitter</button><button id='pauseVerify' class='btn'>Pause</button><button id='stopVerify' class='btn danger'>Stop &amp; cancel</button></div>
+          </div>
+          <details><summary>Advanced verification details</summary><p>Configured toolhead 1840 mm &middot; splitter 1320 mm &middot; correction limit +/-50 mm &middot; encoder telemetry is diagnostic only.</p></details>
+        </section>
+
+        <section id='resultsPanel' class='tab-panel'>
+          <div class='task-head'><div><div class='eyebrow'>Results</div><h2 id='resultTitle'>Saved calibration</h2><p id='resultLead'>Run verification to create a new confidence result for this route.</p></div></div>
+          <div id='resultEmpty' class='notice'>No verification has been completed in this prototype session.</div>
+          <div id='resultSuccess' class='hidden'>
+            <div class='notice ok'><strong>Route verified and parked</strong>The toolhead and splitter checkpoints passed. Filament returned to ACE preload.</div>
+            <div class='metrics'><div class='metric'><small>Toolhead correction</small><b>+7 mm</b></div><div class='metric'><small>Splitter</small><b>Confirmed</b></div><div class='metric'><small>Final position</small><b>Parked</b></div></div>
+            <p class='muted'>The +7 mm correction is diagnostic. It has not changed the saved calibration values.</p>
+            <div class='actions'><button id='verifyAgain' class='btn primary' data-go='verify'>Verify again</button><button class='btn' data-go='calibrate'>Recalibrate using this result</button></div>
+          </div>
+        </section>
+      </div>
+    </section>
+    <footer><button id='resetDemo' class='link-btn'>Reset prototype</button></footer>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let timer = null, paused = false, phase = 'ready', progress = 0, fine = 0, calStep = 0, selectedSlot = 4, selectedScope = 'slot';
+
+    function showTab(name) {
+      document.querySelectorAll('.workflow-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      $(name + 'Panel').classList.add('active');
+    }
+    document.querySelectorAll('.workflow-tab').forEach(b => b.addEventListener('click', () => showTab(b.dataset.tab)));
+    document.querySelectorAll('[data-go]').forEach(b => b.addEventListener('click', () => showTab(b.dataset.go)));
+    function updateScopeSummary() {
+      const wholeAce = selectedScope === 'ace';
+      $('scopeLabel').textContent = wholeAce ? 'Entire ACE defaults' : 'Slot ' + selectedSlot + ' override';
+      $('slotFieldLabel').textContent = wholeAce ? 'Measurement slot' : 'Bowden tube / filament slot';
+      $('derivedRouteHint').textContent = wholeAce ? 'Shared ACE values measured through this route' : 'Per-slot override';
+    }
+    document.querySelectorAll('.scope-option').forEach(button => button.addEventListener('click', () => {
+      selectedScope = button.dataset.scope;
+      document.querySelectorAll('.scope-option').forEach(item => item.classList.toggle('selected', item === button));
+      updateScopeSummary();
+    }));
+    document.querySelectorAll('.slot-option').forEach(button => button.addEventListener('click', () => {
+      selectedSlot = Number(button.dataset.slot);
+      document.querySelectorAll('.slot-option').forEach(item => item.classList.toggle('selected', item === button));
+      $('routeTitle').innerHTML = 'ACE 1 &middot; Slot ' + selectedSlot + ' &rarr; Toolhead T4';
+      $('aceRouteNode').textContent = 'ACE 1 &middot; S' + selectedSlot;
+      $('derivedRoute').innerHTML = 'ACE 1 &middot; Slot ' + selectedSlot + ' &rarr; T4';
+      $('verifySlotCheck').textContent = 'Slot ' + selectedSlot + ' is parked at ACE preload';
+      $('routeMessage').textContent = 'Selected slot is parked at the ACE preload position';
+      $('resultsTabState').textContent = 'No new result';
+      updateScopeSummary();
+    }));
+
+    function setTip(mm, message) {
+      const split = 1320, load = 1840;
+      $('tipA').classList.toggle('hidden', mm > split);
+      $('tipB').classList.toggle('hidden', mm <= split);
+      if (mm <= split) {
+        $('tubeA').style.setProperty('--fill', Math.max(0, Math.min(100, mm / split * 100)) + '%');
+        $('tipA').style.setProperty('--tip', Math.max(0, Math.min(100, mm / split * 100)) + '%');
+        $('tubeB').classList.remove('active');
+        $('tubeB').style.setProperty('--fill', '0%');
+      } else {
+        $('tubeA').style.setProperty('--fill', '100%');
+        $('tubeB').classList.add('active');
+        $('tubeB').style.setProperty('--fill', Math.max(0, Math.min(100, (mm - split) / (load - split) * 100)) + '%');
+        $('tipB').style.setProperty('--tip', Math.max(0, Math.min(100, (mm - split) / (load - split) * 100)) + '%');
+      }
+      $('tipLabel').textContent = message;
+    }
+    function stopTimer() { if (timer) clearInterval(timer); timer = null; }
+    function animate(target, nextPhase) {
+      stopTimer(); paused = false; $('pauseVerify').textContent = 'Pause';
+      timer = setInterval(() => {
+        if (paused) return;
+        const dir = target > progress ? 1 : -1;
+        progress += dir * Math.min(75, Math.abs(target - progress));
+        setTip(progress, 'Tip position: approximately ' + Math.round(progress) + ' mm from preload');
+        $('verifyProgress').style.width = (phase === 'feed' ? progress / 1840 * 33 : phase === 'splitter' ? 33 + (1840 - progress) / 520 * 33 : 66 + (1320 - progress) / 1320 * 34) + '%';
+        if (progress === target) { stopTimer(); nextPhase(); }
+      }, 80);
+    }
+    function startVerification() {
+      phase = 'feed'; progress = 0; fine = 0; $('verifyReady').classList.add('hidden'); $('verifyRun').classList.remove('hidden');
+      $('verifyTitle').textContent = 'Verification in progress'; $('routeStatus').textContent = 'Moving'; $('routeMessage').textContent = 'Feeding continuously toward T4';
+      animate(1840, () => {
+        phase = 'adjust'; $('routeStatus').textContent = 'Needs input'; $('routeMessage').textContent = 'Expected endpoint reached; T4 sensor is clear';
+        $('verifyNotice').className = 'notice warn'; $('verifyNotice').innerHTML = '<strong>Almost there</strong>Use the small movement buttons to trip the T4 sensor.';
+        $('finePanel').classList.add('show'); $('pauseVerify').classList.add('hidden');
+      });
+    }
+    function jog(delta) {
+      if (phase !== 'adjust') return;
+      fine = Math.max(-50, Math.min(50, fine + delta));
+      $('fineOffset').textContent = (fine >= 0 ? '+' : '') + fine + ' mm';
+      setTip(1840 + fine, 'Toolhead correction: ' + (fine >= 0 ? '+' : '') + fine + ' mm');
+      if (fine >= 7) {
+        phase = 'toolhead'; $('finePanel').classList.remove('show'); $('headNode').classList.add('sensor-on'); $('sensorText').textContent = 'sensor triggered';
+        $('routeStatus').textContent = 'Waiting at T4'; $('routeMessage').textContent = 'T4 sensor triggered at +7 mm';
+        $('verifyNotice').className = 'notice ok'; $('verifyNotice').innerHTML = '<strong>T4 reached</strong>Inspect the endpoint, then continue to the splitter.';
+        $('verifyPrimary').classList.remove('hidden'); $('pauseVerify').classList.add('hidden');
+      }
+    }
+    function continueVerification() {
+      if (phase === 'toolhead') {
+        phase = 'splitter'; $('vChip1').className = 'step-chip done'; $('vChip2').className = 'step-chip active'; $('verifyPrimary').classList.add('hidden'); $('pauseVerify').classList.remove('hidden');
+        $('headNode').classList.remove('sensor-on'); $('sensorText').textContent = 'sensor clear'; $('routeStatus').textContent = 'Moving'; $('routeMessage').textContent = 'Retracting continuously to the splitter';
+        $('verifyNotice').className = 'notice'; $('verifyNotice').innerHTML = '<strong>Moving to splitter</strong>The move completes in one continuous leg.';
+        progress = 1847; animate(1320, () => {
+          phase = 'splitter-hold'; $('routeStatus').textContent = 'Waiting at splitter'; $('routeMessage').textContent = 'Confirm the tip is clear of the junction';
+          $('verifyNotice').className = 'notice warn'; $('verifyNotice').innerHTML = '<strong>Splitter checkpoint</strong>Confirm the tip is clear before returning to ACE.';
+          $('verifyPrimary').textContent = 'Splitter is clear - return to ACE'; $('verifyPrimary').classList.remove('hidden'); $('pauseVerify').classList.add('hidden');
+        });
+      } else if (phase === 'splitter-hold') {
+        phase = 'return'; $('vChip2').className = 'step-chip done'; $('vChip3').className = 'step-chip active'; $('verifyPrimary').classList.add('hidden'); $('pauseVerify').classList.remove('hidden');
+        $('routeStatus').textContent = 'Moving'; $('routeMessage').textContent = 'Returning continuously to ACE preload';
+        animate(0, completeVerification);
+      }
+    }
+    function completeVerification() {
+      phase = 'done'; $('vChip3').className = 'step-chip done'; $('verifyProgress').style.width = '100%'; $('routeStatus').textContent = 'Verified'; $('routeMessage').textContent = 'Filament parked at the ACE preload position'; setTip(0, 'Tip position: parked');
+      $('verifyNotice').className = 'notice ok'; $('verifyNotice').innerHTML = '<strong>Verification complete</strong>The route passed and returned to preload.';
+      $('pauseVerify').classList.add('hidden'); $('stopVerify').classList.add('hidden'); $('resultsTabState').textContent = 'Passed'; $('resultEmpty').classList.add('hidden'); $('resultSuccess').classList.remove('hidden'); $('resultTitle').textContent = 'Verification passed'; $('resultLead').textContent = 'ACE 1 Slot ' + selectedSlot + ' to T4 completed the full round trip.';
+      setTimeout(() => showTab('results'), 550);
+    }
+    $('startVerify').addEventListener('click', startVerification);
+    document.querySelectorAll('.jog').forEach(b => b.addEventListener('click', () => jog(Number(b.dataset.jog))));
+    $('verifyPrimary').addEventListener('click', continueVerification);
+    $('pauseVerify').addEventListener('click', () => { paused = !paused; $('pauseVerify').textContent = paused ? 'Resume' : 'Pause'; $('routeStatus').textContent = paused ? 'Paused' : 'Moving'; });
+    $('stopVerify').addEventListener('click', resetDemo);
+    $('verifyAgain').addEventListener('click', resetDemo);
+
+    $('recalibrateBtn').addEventListener('click', () => { $('calibrateSummary').classList.add('hidden'); $('calibrateGuide').classList.remove('hidden'); });
+    $('cancelRecalibrate').addEventListener('click', () => { $('calibrateGuide').classList.add('hidden'); $('calibrateSummary').classList.remove('hidden'); });
+    $('calPrimary').addEventListener('click', () => {
+      calStep += 1;
+      if (calStep === 1) { $('calChip1').className = 'step-chip done'; $('calChip2').className = 'step-chip active'; $('calCount').textContent = 'Step 2 of 3'; $('calTitle').textContent = 'Confirm automatic preload'; $('calText').textContent = 'Reinsert Slot 4 and wait for the ACE to finish its short preload.'; $('calNotice').className = 'notice ok'; $('calNotice').innerHTML = '<strong>T4 is clear</strong>Only the selected route was unloaded.'; $('calPrimary').textContent = 'Preload is ready'; }
+      else if (calStep === 2) { $('calChip2').className = 'step-chip done'; $('calChip3').className = 'step-chip active'; $('calCount').textContent = 'Step 3 of 3'; $('calTitle').textContent = 'Measure the route'; $('calText').textContent = 'The guided measurement will feed to T4 and stop on its sensor.'; $('calNotice').className = 'notice'; $('calNotice').innerHTML = '<strong>Everything is ready</strong>One clear primary action starts the measurement.'; $('calPrimary').textContent = 'Start measurement'; }
+      else { showTab('verify'); resetDemo(); }
+    });
+
+    function resetDemo() {
+      stopTimer(); paused = false; phase = 'ready'; progress = 0; fine = 0; calStep = 0;
+      $('verifyReady').classList.remove('hidden'); $('verifyRun').classList.add('hidden'); $('verifyTitle').textContent = 'Test the saved route'; $('verifyProgress').style.width = '0%'; $('finePanel').classList.remove('show'); $('verifyPrimary').classList.add('hidden'); $('verifyPrimary').textContent = 'Continue to splitter'; $('pauseVerify').classList.remove('hidden'); $('stopVerify').classList.remove('hidden');
+      ['vChip1','vChip2','vChip3'].forEach((id,i) => $(id).className = 'step-chip' + (i === 0 ? ' active' : ''));
+      $('headNode').classList.remove('sensor-on'); $('sensorText').textContent = 'sensor clear'; $('routeStatus').textContent = 'Ready'; $('routeMessage').textContent = 'Filament parked at the ACE preload position'; setTip(0, 'Tip position: parked');
+      $('resultEmpty').classList.remove('hidden'); $('resultSuccess').classList.add('hidden'); $('resultsTabState').textContent = 'No new result'; $('calibrateSummary').classList.remove('hidden'); $('calibrateGuide').classList.add('hidden');
+    }
+    $('resetDemo').addEventListener('click', () => { resetDemo(); showTab('verify'); });
+    updateScopeSummary();
+    setTip(0, 'Tip position: parked');
+  </script>
+</body>
+</html>
